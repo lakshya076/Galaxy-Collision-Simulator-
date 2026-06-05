@@ -21,7 +21,7 @@ void query_gravity_recursive(
 
 void query_gravity(
     const OctreeNode* root,
-    Star& star,
+    const Star& star,
     uint32_t target_idx,
     const Star* all_stars,
     const float* node_masses,
@@ -30,5 +30,5 @@ void query_gravity(
     const float* node_com_z,
     float G,
     float epsilon_sq,
-    float dt
+    float& ax, float& ay, float& az
 );
