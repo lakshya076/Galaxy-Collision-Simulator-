@@ -24,10 +24,14 @@ To achieve extreme real-time simulation performance, the engine adheres to stric
 Instead of standard dynamic allocations (`new`/`delete`) which cause memory fragmentation and latency, the simulator relies on a custom `ArenaAllocator`. It provisions contiguous blocks of RAM instantly. The arena is completely wiped (pointer reset to 0) and rebuilt every single frame.
 
 ### 2. High-Density Cache-Line Octree (`OctreeNode`)
-`OctreeNode` structs are strictly packed and aligned to exactly 64 bytes (`alignas(64)`). This guarantees that reading a node loads a single L1 cache-line, preventing cache misses. 
-* To maintain this 64-byte limit, **no physics data (like mass or center of mass) is stored inside the node struct itself**. 
+`OctreeNode` structs are strictly packed and aligned to exactly 32 bytes (`alignas(32)`). This guarantees that reading a node loads exactly half of an L1 cache-line, preventing cache misses and doubling cache density. 
+* The bounds are mathematically simplified using a `center` coordinate and `half_width` instead of standard min/max bounding boxes.
+* To maintain this 32-byte limit, **no physics data (like mass or center of mass) is stored inside the node struct itself**. 
 
-### 3. Unified Star Struct (Array of Structures)
+### 3. The Indirection Array
+Instead of limiting leaf nodes to a small array of stars, the engine uses a global Indirection Array. Leaf nodes store a 32-bit `start_star_index`, allowing them to hold up to 32 stars without increasing the node struct size. This keeps the octree incredibly shallow, eliminating pointer-chasing latency.
+
+### 4. Unified Star Struct (Array of Structures)
 All stellar particles (visible disc stars, bulge stars, and dark matter macro-particles) are stored in a unified flat array:
 ```cpp
 struct Star {
@@ -38,8 +42,12 @@ struct Star {
 };
 ```
 
-### 4. Node Physics (Structure of Arrays)
-Because the `OctreeNode` cannot exceed 64 bytes, all node-level physics data (such as total mass and 3D Center of Mass) is stored in parallel arrays (`float* node_masses`, etc.) and accessed using the node's index.
+### 5. Node Physics (Structure of Arrays)
+Because the `OctreeNode` cannot exceed 32 bytes, all node-level physics data (such as total mass and 3D Center of Mass) is stored in parallel arrays (`float* node_masses`, etc.) and accessed using the node's index.
+
+### 6. Memory Locality & Prefetching
+* **Morton Z-Order Curve Sorting:** The `stars` array is parallel-sorted using GCC's `__gnu_parallel::sort` according to a 64-bit interleaved Morton Code before tree construction. This ensures OpenMP threads process physically adjacent subsets of the tree, maximizing spatial locality.
+* **Manual L1 Memory Prefetching:** The hottest direct-gravity math loop utilizes compiler intrinsics (`__builtin_prefetch`) to actively pull the *next* star's data into the L1 cache while the FPU computes the inverse square root math for the *current* star.
 
 ---
 
@@ -66,8 +74,8 @@ The parser and database used to process and parse real star catalogs into binary
 * A C++17 compliant compiler (e.g., `g++` or `clang++`).
 
 ### Compiling and Running (Direct CLI)
-To compile the current build containing the generator and basic octree builder:
+To compile the current build containing the generator, the octree builder, and the Barnes-Hut integration loop:
 ```powershell
-g++ -std=c++17 -O3 .\main.cpp .\generator.cpp .\engine.cpp -o main.exe
+g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp -o main.exe
 .\main.exe
 ```
