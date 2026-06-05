@@ -1,12 +1,18 @@
 #include <iostream>
 #include <random>
 #include <chrono>
+#include <vector>
+#include <omp.h>
 #include "generator.h"
 #include "engine.h"
 #include "arena_allocator.h"
 #include "gravity_aggregator.h"
 
 using namespace std;
+
+struct Accel {
+    float ax, ay, az;
+};
 
 int main() {
     int num_dm = 50000;
@@ -82,9 +88,34 @@ int main() {
     float epsilon_sq = 1e-3f; // Softening parameter
     float dt = 0.01f;
 
-    // Calculate gravity and update coordinates for all stars
-    for (uint32_t i = 0; i < num_stars; i++) {
-        query_gravity(root, stars[i], i, stars, node_masses, node_com_x, node_com_y, node_com_z, G, epsilon_sq, dt);
+    std::vector<Accel> accels(num_stars);
+
+    #ifdef _OPENMP
+    cout << "Using " << omp_get_max_threads() << " OpenMP threads for calculation." << endl;
+    #else
+    cout << "Using 1 thread (OpenMP disabled)." << endl;
+    #endif
+
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (int i = 0; i < num_stars; ++i) {
+        query_gravity(
+            root, stars[i], i, stars, 
+            node_masses, node_com_x, node_com_y, node_com_z, 
+            G, epsilon_sq, accels[i].ax, accels[i].ay, accels[i].az
+        );
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < num_stars; ++i) {
+        // Update velocity
+        stars[i].vx += accels[i].ax * dt;
+        stars[i].vy += accels[i].ay * dt;
+        stars[i].vz += accels[i].az * dt;
+
+        // Update position
+        stars[i].x += stars[i].vx * dt;
+        stars[i].y += stars[i].vy * dt;
+        stars[i].z += stars[i].vz * dt;
     }
 
     end_time = chrono::high_resolution_clock::now();
