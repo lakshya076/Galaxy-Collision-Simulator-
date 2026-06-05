@@ -4,6 +4,7 @@
 #include "generator.h"
 #include "engine.h"
 #include "arena_allocator.h"
+#include "gravity_aggregator.h"
 
 using namespace std;
 
@@ -73,6 +74,22 @@ int main() {
 
     cout << "\nPopulating Node Metadata" << endl;
     node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z);
+
+    cout << "\nRunning Gravity Query and Integration step for all stars..." << endl;
+    start_time = chrono::high_resolution_clock::now();
+
+    float G = 1.0f;
+    float epsilon_sq = 1e-3f; // Softening parameter
+    float dt = 0.01f;
+
+    // Calculate gravity and update coordinates for all stars
+    for (uint32_t i = 0; i < num_stars; i++) {
+        query_gravity(root, stars[i], i, stars, node_masses, node_com_x, node_com_y, node_com_z, G, epsilon_sq, dt);
+    }
+
+    end_time = chrono::high_resolution_clock::now();
+    diff = end_time - start_time;
+    cout << "Gravity Calculation & Step Time: " << diff.count() << " seconds" << endl;
 
     delete[] node_masses;
     delete[] node_com_x;
