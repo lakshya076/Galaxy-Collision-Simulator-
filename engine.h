@@ -19,7 +19,7 @@ int get_child_index(OctreeNode* node, float x, float y, float z);
 
 uint32_t get_node_index(const OctreeNode* root, const OctreeNode* node);
 
-void insert_star(OctreeNode* node, uint32_t star_idx, const Star* all_stars, ArenaAllocator& arena);
+void insert_star(OctreeNode* node, uint32_t star_idx, const Star* all_stars, ArenaAllocator& arena, uint32_t* leaf_indices, uint32_t& next_free_idx);
 
 void node_physics(OctreeNode* node, OctreeNode* root, const Star* stars, float* node_masses, 
-    float* node_com_x, float* node_com_y, float* node_com_z);
+    float* node_com_x, float* node_com_y, float* node_com_z, const uint32_t* leaf_indices);

@@ -3,32 +3,21 @@
 using namespace std;
 
 void set_child_bounds(OctreeNode* parent, OctreeNode* child, int index) {
-    float mid_x = (parent->min_x + parent->max_x) / 2.0f;
-    float mid_y = (parent->min_y + parent->max_y) / 2.0f;
-    float mid_z = (parent->min_z + parent->max_z) / 2.0f;
-
-    child->min_x = (index & 1) ? mid_x : parent->min_x;
-    child->max_x = (index & 1) ? parent->max_x : mid_x;
-
-    child->min_y = (index & 2) ? mid_y : parent->min_y;
-    child->max_y = (index & 2) ? parent->max_y : mid_y;
-
-    child->min_z = (index & 4) ? mid_z : parent->min_z;
-    child->max_z = (index & 4) ? parent->max_z : mid_z;
+    float quarter = parent->half_width * 0.5f;
+    child->half_width = quarter;
+    child->center_x = parent->center_x + ((index & 1) ? quarter : -quarter);
+    child->center_y = parent->center_y + ((index & 2) ? quarter : -quarter);
+    child->center_z = parent->center_z + ((index & 4) ? quarter : -quarter);
 
     child->is_leaf = true;
     child->star_count = 0;
 }
 
 int get_child_index(OctreeNode* node, float x, float y, float z) {
-    float mid_x = (node->min_x + node->max_x) / 2.0f;
-    float mid_y = (node->min_y + node->max_y) / 2.0f;
-    float mid_z = (node->min_z + node->max_z) / 2.0f;
-
     int idx = 0;
-    idx |= (x >= mid_x) ? 1 : 0;
-    idx |= (y >= mid_y) ? 2 : 0;
-    idx |= (z >= mid_z) ? 4 : 0;
+    idx |= (x >= node->center_x) ? 1 : 0;
+    idx |= (y >= node->center_y) ? 2 : 0;
+    idx |= (z >= node->center_z) ? 4 : 0;
     return idx;
 }
 
@@ -36,54 +25,55 @@ uint32_t get_node_index(const OctreeNode* root, const OctreeNode* node) {
     return static_cast<uint32_t>(node - root);
 }
 
-void insert_star(OctreeNode* node, uint32_t star_idx, const Star* all_stars, ArenaAllocator& arena) {
+void insert_star(OctreeNode* node, uint32_t star_idx, const Star* all_stars, ArenaAllocator& arena, uint32_t* leaf_indices, uint32_t& next_free_idx) {
     if (node->is_leaf) {
-        if (node->star_count < 8) {
-            node->star_indices[node->star_count++] = star_idx;
+        if (node->star_count < 32) {
+            leaf_indices[node->start_star_index + node->star_count] = star_idx;
+            node->star_count++;
         } else {
             node->is_leaf = false;
             
-            uint32_t old_stars[8];
-            for (int i = 0; i < 8; i++) {
-                old_stars[i] = node->star_indices[i];
-            }
+            uint32_t old_count = node->star_count;
+            uint32_t old_start = node->start_star_index;
 
-            // Allocate 512 bytes for 8 contiguous children
+            // Allocate 256 bytes for 8 contiguous children (32 bytes each)
             OctreeNode* children = arena.alloc_array<OctreeNode>(8);
             node->first_child = children;
 
             for (int i = 0; i < 8; i++) {
                 set_child_bounds(node, &children[i], i);
+                children[i].start_star_index = next_free_idx;
+                next_free_idx += 32;
             }
 
-            // Route the original 8 stars into new children
-            for (int i = 0; i < 8; i++) {
-                uint32_t s_idx = old_stars[i];
+            // Route the original stars into new children
+            for (uint32_t i = 0; i < old_count; i++) {
+                uint32_t s_idx = leaf_indices[old_start + i];
                 int c_idx = get_child_index(node, all_stars[s_idx].x, all_stars[s_idx].y, all_stars[s_idx].z);
-                insert_star(&children[c_idx], s_idx, all_stars, arena);
+                insert_star(&children[c_idx], s_idx, all_stars, arena, leaf_indices, next_free_idx);
             }
 
             // Route the new star
             int c_idx = get_child_index(node, all_stars[star_idx].x, all_stars[star_idx].y, all_stars[star_idx].z);
-            insert_star(&children[c_idx], star_idx, all_stars, arena);
+            insert_star(&children[c_idx], star_idx, all_stars, arena, leaf_indices, next_free_idx);
         }
     } else {
         int c_idx = get_child_index(node, all_stars[star_idx].x, all_stars[star_idx].y, all_stars[star_idx].z);
-        insert_star(&node->first_child[c_idx], star_idx, all_stars, arena);
+        insert_star(&node->first_child[c_idx], star_idx, all_stars, arena, leaf_indices, next_free_idx);
     }
 }
 
 
 void node_physics(OctreeNode* node, OctreeNode* root, const Star* stars, float* node_masses, 
-    float* node_com_x, float* node_com_y, float* node_com_z) {
+    float* node_com_x, float* node_com_y, float* node_com_z, const uint32_t* leaf_indices) {
         uint32_t idx = get_node_index(root, node);
 
         if (node->is_leaf) {
             float total_mass = 0.0f;
             float weighted_x = 0.0f, weighted_y = 0.0f, weighted_z = 0.0f;
 
-            for (int i = 0; i < node->star_count; i++) {
-                uint32_t star_idx = node->star_indices[i];
+            for (uint32_t i = 0; i < node->star_count; i++) {
+                uint32_t star_idx = leaf_indices[node->start_star_index + i];
                 float curr_mass = stars[star_idx].mass;
                 total_mass += curr_mass;
                 weighted_x += stars[star_idx].x * curr_mass;
@@ -98,9 +88,9 @@ void node_physics(OctreeNode* node, OctreeNode* root, const Star* stars, float* 
                 node_com_y[idx] = weighted_y / total_mass;
                 node_com_z[idx] = weighted_z / total_mass;
             } else {
-                node_com_x[idx] = (node->min_x + node->max_x) * 0.5f;
-                node_com_y[idx] = (node->min_y + node->max_y) * 0.5f;
-                node_com_z[idx] = (node->min_z + node->max_z) * 0.5f;
+                node_com_x[idx] = node->center_x;
+                node_com_y[idx] = node->center_y;
+                node_com_z[idx] = node->center_z;
             }
         } else {
             float total_mass = 0.0f;
@@ -108,7 +98,7 @@ void node_physics(OctreeNode* node, OctreeNode* root, const Star* stars, float* 
             
             for (int i = 0; i < 8; ++i) {
                 OctreeNode* child = &node->first_child[i];
-                node_physics(child, root, stars, node_masses, node_com_x, node_com_y, node_com_z);
+                node_physics(child, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_indices);
 
                 uint32_t child_idx = get_node_index(root, child);
                 float cm = node_masses[child_idx];
@@ -124,9 +114,9 @@ void node_physics(OctreeNode* node, OctreeNode* root, const Star* stars, float* 
                 node_com_y[idx] = weighted_y / total_mass;
                 node_com_z[idx] = weighted_z / total_mass;
             } else {
-                node_com_x[idx] = (node->min_x + node->max_x) * 0.5f;
-                node_com_y[idx] = (node->min_y + node->max_y) * 0.5f;
-                node_com_z[idx] = (node->min_z + node->max_z) * 0.5f;
+                node_com_x[idx] = node->center_x;
+                node_com_y[idx] = node->center_y;
+                node_com_z[idx] = node->center_z;
             }
         }
 }

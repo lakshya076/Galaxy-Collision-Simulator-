@@ -56,14 +56,23 @@ int main() {
     ArenaAllocator arena(1024 * 1024 * 64);
     OctreeNode* root = arena.alloc<OctreeNode>();
 
-    root->min_x = min_x; root->min_y = min_y; root->min_z = min_z;
-    root->max_x = max_x; root->max_y = max_y; root->max_z = max_z;
+    float max_span = std::max({max_x - min_x, max_y - min_y, max_z - min_z});
+    root->half_width = max_span * 0.5f;
+    root->center_x = (min_x + max_x) * 0.5f;
+    root->center_y = (min_y + max_y) * 0.5f;
+    root->center_z = (min_z + max_z) * 0.5f;
     root->is_leaf = true;
     root->star_count = 0;
 
+    const size_t max_nodes = (1024 * 1024 * 64) / sizeof(OctreeNode);
+    uint32_t* leaf_star_indices = new uint32_t[max_nodes * 32];
+    uint32_t next_free_idx = 0;
+    root->start_star_index = next_free_idx;
+    next_free_idx += 32;
+
     cout << "\nBuilding Basic Octree:" << endl;
     for (uint32_t i = 0; i < num_stars; i++) {
-        insert_star(root, i, stars, arena);
+        insert_star(root, i, stars, arena, leaf_star_indices, next_free_idx);
     }
 
     end_time = chrono::high_resolution_clock::now();
@@ -72,14 +81,13 @@ int main() {
     cout << "\nTotal Initialization Time: " << diff.count() << " seconds" << endl;
     cout << "Arena Memory Consumed: " << (arena.get_used_memory() / 1024.0 / 1024.0) << " MB" << endl;
 
-    const size_t max_nodes = (1024 * 1024 * 64) / sizeof(OctreeNode);
     float* node_masses = new float[max_nodes];
     float* node_com_x = new float[max_nodes];
     float* node_com_y = new float[max_nodes];
     float* node_com_z = new float[max_nodes];
 
     cout << "\nPopulating Node Metadata" << endl;
-    node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z);
+    node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices);
 
     cout << "\nRunning Gravity Query and Integration step for all stars..." << endl;
     start_time = chrono::high_resolution_clock::now();
@@ -100,7 +108,7 @@ int main() {
     for (int i = 0; i < num_stars; ++i) {
         query_gravity(
             root, stars[i], i, stars, 
-            node_masses, node_com_x, node_com_y, node_com_z, 
+            node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices,
             G, epsilon_sq, accels[i].ax, accels[i].ay, accels[i].az
         );
     }
@@ -122,6 +130,7 @@ int main() {
     diff = end_time - start_time;
     cout << "Gravity Calculation & Step Time: " << diff.count() << " seconds" << endl;
 
+    delete[] leaf_star_indices;
     delete[] node_masses;
     delete[] node_com_x;
     delete[] node_com_y;
