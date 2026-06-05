@@ -10,21 +10,22 @@ struct Star {
     bool is_dm;
 }; 
 
-// 64-byte strictly aligned
-struct alignas(64) OctreeNode {
-    float min_x, min_y, min_z;  // 12 bytes
-    float max_x, max_y, max_z;  // 12 bytes
+// 32-byte strictly aligned
+struct alignas(32) OctreeNode {
+    float center_x, center_y, center_z; // 12 bytes
+    float half_width;                   // 4 bytes
 
     union {
         OctreeNode* first_child; // 8 bytes
+        struct {
+            uint32_t start_star_index; // 4 bytes
+            uint32_t star_count;       // 4 bytes
+        };
+    }; // 8 bytes
 
-        uint32_t star_indices[8]; // 32 bytes
-    }; // 32 bytes
-
-    uint8_t star_count; // 1 byte
     bool is_leaf; // 1 byte
-    uint8_t padding[6]; // Explicit padding
+    uint8_t padding[7]; // 7 bytes padding to reach 32 bytes
 };
 
-// Compile-time assertion to guarantee L1 Cache-Line layout
-static_assert(sizeof(OctreeNode) == 64, "OctreeNode must be exactly 64 bytes for cache alignment");
+// Compile-time assertion to guarantee half-L1 Cache-Line layout
+static_assert(sizeof(OctreeNode) == 32, "OctreeNode must be exactly 32 bytes for optimized cache alignment");
