@@ -65,6 +65,19 @@ int main() {
     cout << "\nTotal Initialization Time: " << diff.count() << " seconds" << endl;
     cout << "Arena Memory Consumed: " << (arena.get_used_memory() / 1024.0 / 1024.0) << " MB" << endl;
 
+    const size_t max_nodes = (1024 * 1024 * 64) / sizeof(OctreeNode);
+    float* node_masses = new float[max_nodes];
+    float* node_com_x = new float[max_nodes];
+    float* node_com_y = new float[max_nodes];
+    float* node_com_z = new float[max_nodes];
+
+    cout << "\nPopulating Node Metadata" << endl;
+    node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z);
+
+    delete[] node_masses;
+    delete[] node_com_x;
+    delete[] node_com_y;
+    delete[] node_com_z;
     delete[] stars;
 
     return 0;

@@ -2,64 +2,6 @@
 
 using namespace std;
 
-
-float box_distance_squared(OctreeNode* node, float tx, float ty, float tz) {
-    float closest_x = max(node->min_x, min(tx, node->max_x));
-    float closest_y = max(node->min_y, min(ty, node->max_y));
-    float closest_z = max(node->min_z, min(tz, node->max_z));
-
-    float dx = closest_x - tx;
-    float dy = closest_y - ty;
-    float dz = closest_z - tz;
-    return (dx * dx) + (dy * dy) + (dz * dz);
-}
-
-void query_radius_recursive(OctreeNode* node, float tx, float ty, float tz, float r_sq, const Star* all_stars, vector<QueryResult>& results) {
-    if (box_distance_squared(node, tx, ty, tz) > r_sq) return;
-
-    if (node->is_leaf) {
-        for (int i = 0; i < node->star_count; i++) {
-            uint32_t s_idx = node->star_indices[i];
-            const Star& s = all_stars[s_idx];
-            float dx = s.x - tx; float dy = s.y - ty; float dz = s.z - tz;
-            float dist_sq = (dx*dx) + (dy*dy) + (dz*dz);
-            if (dist_sq <= r_sq) {
-                results.push_back({s_idx, dist_sq});
-            }
-        }
-    } else {
-        for (int i = 0; i < 8; i++) {
-            query_radius_recursive(&node->first_child[i], tx, ty, tz, r_sq, all_stars, results);
-        }
-    }
-}
-
-void query_knn_recursive(OctreeNode* node, float tx, float ty, float tz, int k, const Star* all_stars, priority_queue<QueryResult>& heap) {
-    float current_r_sq = (heap.size() == k) ? heap.top().dist_sq : numeric_limits<float>::max();
-    
-    if (box_distance_squared(node, tx, ty, tz) > current_r_sq) return;
-
-    if (node->is_leaf) {
-        for (int i = 0; i < node->star_count; i++) {
-            uint32_t s_idx = node->star_indices[i];
-            const Star& s = all_stars[s_idx];
-            float dx = s.x - tx; float dy = s.y - ty; float dz = s.z - tz;
-            float dist_sq = (dx*dx) + (dy*dy) + (dz*dz);
-            
-            if (heap.size() < k) {
-                heap.push({s_idx, dist_sq});
-            } else if (dist_sq < heap.top().dist_sq) {
-                heap.pop();
-                heap.push({s_idx, dist_sq});
-            }
-        }
-    } else {
-        for (int i = 0; i < 8; i++) {
-            query_knn_recursive(&node->first_child[i], tx, ty, tz, k, all_stars, heap);
-        }
-    }
-}
-
 void set_child_bounds(OctreeNode* parent, OctreeNode* child, int index) {
     float mid_x = (parent->min_x + parent->max_x) / 2.0f;
     float mid_y = (parent->min_y + parent->max_y) / 2.0f;
@@ -88,6 +30,10 @@ int get_child_index(OctreeNode* node, float x, float y, float z) {
     idx |= (y >= mid_y) ? 2 : 0;
     idx |= (z >= mid_z) ? 4 : 0;
     return idx;
+}
+
+uint32_t get_node_index(const OctreeNode* root, const OctreeNode* node) {
+    return static_cast<uint32_t>(node - root);
 }
 
 void insert_star(OctreeNode* node, uint32_t star_idx, const Star* all_stars, ArenaAllocator& arena) {
@@ -125,4 +71,62 @@ void insert_star(OctreeNode* node, uint32_t star_idx, const Star* all_stars, Are
         int c_idx = get_child_index(node, all_stars[star_idx].x, all_stars[star_idx].y, all_stars[star_idx].z);
         insert_star(&node->first_child[c_idx], star_idx, all_stars, arena);
     }
+}
+
+
+void node_physics(OctreeNode* node, OctreeNode* root, const Star* stars, float* node_masses, 
+    float* node_com_x, float* node_com_y, float* node_com_z) {
+        uint32_t idx = get_node_index(root, node);
+
+        if (node->is_leaf) {
+            float total_mass = 0.0f;
+            float weighted_x = 0.0f, weighted_y = 0.0f, weighted_z = 0.0f;
+
+            for (int i = 0; i < node->star_count; i++) {
+                uint32_t star_idx = node->star_indices[i];
+                float curr_mass = stars[star_idx].mass;
+                total_mass += curr_mass;
+                weighted_x += stars[star_idx].x * curr_mass;
+                weighted_y += stars[star_idx].y * curr_mass;
+                weighted_z += stars[star_idx].z * curr_mass;
+            }
+
+            node_masses[idx] = total_mass;
+
+            if(total_mass > 0.0f) {
+                node_com_x[idx] = weighted_x / total_mass;
+                node_com_y[idx] = weighted_y / total_mass;
+                node_com_z[idx] = weighted_z / total_mass;
+            } else {
+                node_com_x[idx] = (node->min_x + node->max_x) * 0.5f;
+                node_com_y[idx] = (node->min_y + node->max_y) * 0.5f;
+                node_com_z[idx] = (node->min_z + node->max_z) * 0.5f;
+            }
+        } else {
+            float total_mass = 0.0f;
+            float weighted_x = 0.0f, weighted_y = 0.0f, weighted_z = 0.0f;
+            
+            for (int i = 0; i < 8; ++i) {
+                OctreeNode* child = &node->first_child[i];
+                node_physics(child, root, stars, node_masses, node_com_x, node_com_y, node_com_z);
+
+                uint32_t child_idx = get_node_index(root, child);
+                float cm = node_masses[child_idx];
+                total_mass += cm;
+                weighted_x += node_com_x[child_idx] * cm;
+                weighted_y += node_com_y[child_idx] * cm;
+                weighted_z += node_com_z[child_idx] * cm;
+            }
+
+            node_masses[idx] = total_mass;
+            if (total_mass > 0.0f) {
+                node_com_x[idx] = weighted_x / total_mass;
+                node_com_y[idx] = weighted_y / total_mass;
+                node_com_z[idx] = weighted_z / total_mass;
+            } else {
+                node_com_x[idx] = (node->min_x + node->max_x) * 0.5f;
+                node_com_y[idx] = (node->min_y + node->max_y) * 0.5f;
+                node_com_z[idx] = (node->min_z + node->max_z) * 0.5f;
+            }
+        }
 }
