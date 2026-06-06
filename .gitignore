@@ -31,8 +31,9 @@
 *.out
 *.app
 
-# Spatial DB Custom Data ignores
+# Custom Data ignores
 data/
+*.bin
 
 # OS generated files
 .DS_Store

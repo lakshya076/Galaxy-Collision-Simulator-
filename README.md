@@ -9,10 +9,14 @@ A high-performance, custom-built 3D Galaxy Collision Simulator written in pure C
 This project is built incrementally following a rigorous engineering roadmap:
 
 - **Phase 1-4: Foundation & Spatial DB Integration** - Standardized particle representations, memory pooling, and importing stellar catalogs from spatial data sources. This was completed in another project first stored as **[Spatial_DB Repository](https://github.com/lakshya076/Spatial_DB)**
-- **Phase 5: Initial Conditions Generator** - Mathematical generation of stable galaxies (Miyamoto-Nagai stellar discs, Hernquist bulges, and dark matter halos) placed on a collision course.
+- **Phase 5: Initial Conditions Generator** - Mathematical generation of stable galaxies using
+  - Miyamoto-Nagai stellar discs
+  - Hernquist bulges
+  - Dark Matter Halos
 - **Phase 6: Barnes-Hut Physics Core** - Bottom-up mass aggregation and fast gravitational force calculation using the $\theta = \frac{s}{d}$ approximation.
 - **Phase 7: The Master Simulation Loop** - Main temporal integration loop connecting the octree structures with Newtonian physics over time steps ($\Delta t$).
-- **Phase 8: Graphics Pipeline & Multithreading** - OpenGL buffer streaming and parallelizing the gravity queries using a thread pool.
+- **Phase 8: Live OpenGL Graphics Pipeline** - Real-time visualization using GLFW/GLEW with a free-flying WASD camera. The unified `Star` memory layout streams directly into OpenGL Vertex Buffer Objects (VBOs) with zero overhead.
+- **Phase 9: Offline Physics Baking** - Decoupling the engine into a background Physics Baker (dumps binary data to SSD) and a GPU Playback Viewer for 144+ FPS scrubbing of extremely heavy simulations.
 
 ---
 
@@ -71,11 +75,46 @@ The parser and database used to process and parse real star catalogs into binary
 ## 🚀 Getting Started
 
 ### Prerequisites
-* A C++17 compliant compiler (e.g., `g++` or `clang++`).
+* A C++17 compliant compiler (e.g., `g++` on Linux or MSYS2/MinGW64 on Windows).
+* OpenMP support.
+* Modern OpenGL development libraries.
 
-### Compiling and Running (Direct CLI)
-To compile the current build containing the generator, the octree builder, and the Barnes-Hut integration loop:
-```powershell
-g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp -o main.exe
-.\main.exe
+On MSYS2 (Windows), install the dependencies:
+```bash
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-glfw mingw-w64-x86_64-glew mingw-w64-x86_64-glm
 ```
+
+### Compiling and Running
+
+This simulator is split into three decoupled execution modes, allowing you to bake incredibly heavy physics offline and play them back later in real-time.
+
+#### 1. Live Mode (Normal)
+Runs the physics engine and immediately renders each frame. Best for moderate particle counts.
+```bash
+g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o main.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+
+$env:PATH += ";C:\msys64\mingw64\bin"; .\main.exe
+```
+
+#### 2. Bake Mode (Offline)
+Runs purely in the terminal. OpenGL is disabled. Calculates physics as fast as possible and dumps the raw `Star` memory array (32-bytes per particle) directly to `simulation.bin` using massive block writes. Keep in mind for 1000 frame bake, this file reaches around **9.2gb** in size.
+```bash
+g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_BAKE .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o bake.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+
+.\bake.exe
+```
+
+#### 3. Playback Mode (Viewer)
+Disables the physics engine. Initializes OpenGL and rapidly streams frames from `simulation.bin` directly into the VRAM, allowing you to scrub through insanely heavy physics calculations at 60-144 FPS.
+```bash
+g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_PLAYBACK .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o play.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+
+$env:PATH += ";C:\msys64\mingw64\bin"; .\play.exe
+```
+
+### Controls (Live & Playback Mode)
+- **Mouse Look:** Pitch and Yaw rotation.
+- **W / S:** Move Forward / Backward.
+- **A / D:** Strafe Left / Right.
+- **Mouse Scroll:** Fast Forward / Backward Zoom.
+- **ESC:** Exit Simulation.
