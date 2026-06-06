@@ -8,11 +8,16 @@
 #include "arena_allocator.h"
 #include "gravity_aggregator.h"
 #include <algorithm>
+#if !defined(_MSC_VER)
 #include <parallel/algorithm>
+#endif
 #include "morton.h"
 #include "renderer.h"
 #include <cstdio>
 #include <string>
+
+#include <thread>
+#include "cuda_engine.h"
 
 using namespace std;
 
@@ -28,7 +33,33 @@ int main(int argc, char** argv) {
     int particles_per_galaxy = num_dm + num_disc + num_bulge;
     int total_particles = particles_per_galaxy * 2;
     
-    Star* stars = new Star[total_particles];
+    bool use_gpu = true;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--cpu") {
+            use_gpu = false;
+        }
+    }
+
+    if (use_gpu) {
+        if (!cuda_init(total_particles)) {
+            std::cout << "Falling back to CPU OpenMP mode..." << std::endl;
+            use_gpu = false;
+        } else {
+            std::cout << "GPU Acceleration initialized successfully." << std::endl;
+        }
+    }
+
+    Star* stars = nullptr;
+    #ifndef MODE_PLAYBACK
+    if (use_gpu) {
+        cuda_allocate_pinned_stars(&stars, total_particles);
+    } else {
+        stars = new Star[total_particles];
+    }
+    #else
+    stars = new Star[total_particles];
+    #endif
+
     int num_stars = total_particles;
     int num_visible = 2 * (num_disc + num_bulge);
 
@@ -42,8 +73,12 @@ int main(int argc, char** argv) {
     auto end_time = chrono::high_resolution_clock::now();
     chrono::duration<double> diff = end_time - start_time;
 
-    cout << "Collision scenario generated successfully" << std::endl;
+    cout << "Collision scenario generated successfully in " << diff.count() << "s" << std::endl;
     cout << "Total stars spawned: " << total_particles << std::endl;
+
+    if (use_gpu) {
+        cuda_upload_initial_stars(stars, num_stars);
+    }
     
 #ifndef MODE_BAKE
     // Initialize OpenGL for Live or Playback mode
@@ -55,6 +90,9 @@ int main(int argc, char** argv) {
         setup_buffers(stars, num_visible);
     #else
         setup_buffers(stars, num_stars);
+        if (use_gpu) {
+            cuda_register_vbo(get_vbo_handle());
+        }
     #endif
 #else
     GLFWwindow* window = nullptr;
@@ -92,6 +130,21 @@ int main(int argc, char** argv) {
         cout << "Baking " << total_frames << " frames." << endl;
     }
 
+    // Allocate Pinned Host Buffers for double-buffered SSD writes
+    PlaybackStar* host_buf_A = nullptr;
+    PlaybackStar* host_buf_B = nullptr;
+    if (use_gpu) {
+        cuda_allocate_pinned_playback(&host_buf_A, num_visible);
+        cuda_allocate_pinned_playback(&host_buf_B, num_visible);
+    } else {
+        host_buf_A = new PlaybackStar[num_visible];
+        host_buf_B = new PlaybackStar[num_visible];
+    }
+
+    std::thread writer_thread;
+    PlaybackStar* current_write_buf = host_buf_A;
+    PlaybackStar* next_write_buf = host_buf_B;
+
     double total_time = 0;
     for (frame_count = 0; frame_count < total_frames; ++frame_count) {
         start_time = chrono::high_resolution_clock::now();
@@ -113,12 +166,19 @@ int main(int argc, char** argv) {
         float global_max = std::max({max_x, max_y, max_z});
 
         // Morton Sort
+#if defined(_MSC_VER)
+        std::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
+            return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
+                   get_morton_code(b.x, b.y, b.z, global_min, global_max);
+        });
+#else
         __gnu_parallel::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
             return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
                    get_morton_code(b.x, b.y, b.z, global_min, global_max);
         });
+#endif
 
-        // Reset Arena and Build Octree
+        // Reset Arena and Build Octree (CPU tree building is very fast)
         arena.reset();
         OctreeNode* root = arena.alloc<OctreeNode>();
 
@@ -141,37 +201,59 @@ int main(int argc, char** argv) {
         // Metadata Population
         node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices);
 
-        // Gravity Queries
-        #pragma omp parallel for schedule(dynamic, 256)
-        for (int i = 0; i < num_stars; ++i) {
-            query_gravity(
-                root, stars[i], i, stars, 
+        if (use_gpu) {
+            cuda_physics_step(
+                stars, num_stars, G, epsilon_sq, dt,
+                static_cast<const OctreeNode*>(arena.get_base_ptr()),
+                static_cast<const OctreeNode*>(arena.get_base_ptr()),
+                arena.get_used_memory() / sizeof(OctreeNode),
                 node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices,
-                G, epsilon_sq, accels[i].ax, accels[i].ay, accels[i].az
+                false // use_interop = false for BAKE
             );
-        }
+        } else {
+            // Gravity Queries
+            #pragma omp parallel for schedule(dynamic, 256)
+            for (int i = 0; i < num_stars; ++i) {
+                query_gravity(
+                    root, stars[i], i, stars, 
+                    node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices,
+                    G, epsilon_sq, accels[i].ax, accels[i].ay, accels[i].az
+                );
+            }
 
-        // Velocity / Position Integration
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < num_stars; ++i) {
-            stars[i].vx += accels[i].ax * dt;
-            stars[i].vy += accels[i].ay * dt;
-            stars[i].vz += accels[i].az * dt;
+            // Velocity / Position Integration
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < num_stars; ++i) {
+                stars[i].vx += accels[i].ax * dt;
+                stars[i].vy += accels[i].ay * dt;
+                stars[i].vz += accels[i].az * dt;
 
-            stars[i].x += stars[i].vx * dt;
-            stars[i].y += stars[i].vy * dt;
-            stars[i].z += stars[i].vz * dt;
-        }
-
-        // Dump to file (visible stars only in PlaybackStar format)
-        std::vector<PlaybackStar> write_buf;
-        write_buf.reserve(num_stars);
-        for (int i = 0; i < num_stars; ++i) {
-            if (!stars[i].is_dm) {
-                write_buf.push_back({stars[i].x, stars[i].y, stars[i].z, stars[i].r, stars[i].g, stars[i].b, 0});
+                stars[i].x += stars[i].vx * dt;
+                stars[i].y += stars[i].vy * dt;
+                stars[i].z += stars[i].vz * dt;
             }
         }
-        fwrite(write_buf.data(), sizeof(PlaybackStar), write_buf.size(), out_file);
+
+        // Wait for the background writer thread from the previous frame to finish
+        if (writer_thread.joinable()) {
+            writer_thread.join();
+        }
+
+        // Swap write buffers for double-buffering
+        std::swap(current_write_buf, next_write_buf);
+
+        // Copy visible stars from the current frame to the write buffer
+        int local_write_count = 0;
+        for (int i = 0; i < num_stars; ++i) {
+            if (!stars[i].is_dm) {
+                current_write_buf[local_write_count++] = {stars[i].x, stars[i].y, stars[i].z, stars[i].r, stars[i].g, stars[i].b, 0};
+            }
+        }
+
+        // Launch background thread to write this frame to SSD
+        writer_thread = std::thread([out_file, current_write_buf, local_write_count]() {
+            fwrite(current_write_buf, sizeof(PlaybackStar), local_write_count, out_file);
+        });
 
         end_time = chrono::high_resolution_clock::now();
         chrono::duration<double> diff = end_time - start_time;
@@ -181,8 +263,22 @@ int main(int argc, char** argv) {
             cout << "Baked " << frame_count << "/" << total_frames << " frames (" << total_time << "s)" << endl;
         }
     }
+
+    // Clean up last background write
+    if (writer_thread.joinable()) {
+        writer_thread.join();
+    }
+
     fclose(out_file);
     cout << "Baking Complete in " << total_time << "s" << endl;
+
+    if (use_gpu) {
+        cuda_free_pinned_playback(host_buf_A);
+        cuda_free_pinned_playback(host_buf_B);
+    } else {
+        delete[] host_buf_A;
+        delete[] host_buf_B;
+    }
 
 #elif defined(MODE_PLAYBACK)
     cout << "Reading from simulation.bin..." << endl;
@@ -343,10 +439,17 @@ int main(int argc, char** argv) {
         float global_max = std::max({max_x, max_y, max_z});
 
         // Morton Sort
+#if defined(_MSC_VER)
+        std::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
+            return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
+                   get_morton_code(b.x, b.y, b.z, global_min, global_max);
+        });
+#else
         __gnu_parallel::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
             return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
                    get_morton_code(b.x, b.y, b.z, global_min, global_max);
         });
+#endif
 
         // Reset Arena and Build Octree
         arena.reset();
@@ -371,30 +474,43 @@ int main(int argc, char** argv) {
         // Metadata Population
         node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices);
 
-        // Gravity Queries
-        #pragma omp parallel for schedule(dynamic, 256)
-        for (int i = 0; i < num_stars; ++i) {
-            query_gravity(
-                root, stars[i], i, stars, 
+        if (use_gpu) {
+            cuda_physics_step(
+                stars, num_stars, G, epsilon_sq, dt,
+                static_cast<const OctreeNode*>(arena.get_base_ptr()),
+                static_cast<const OctreeNode*>(arena.get_base_ptr()),
+                arena.get_used_memory() / sizeof(OctreeNode),
                 node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices,
-                G, epsilon_sq, accels[i].ax, accels[i].ay, accels[i].az
+                true // use_interop = true for LIVE
             );
-        }
+        } else {
+            // Gravity Queries
+            #pragma omp parallel for schedule(dynamic, 256)
+            for (int i = 0; i < num_stars; ++i) {
+                query_gravity(
+                    root, stars[i], i, stars, 
+                    node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices,
+                    G, epsilon_sq, accels[i].ax, accels[i].ay, accels[i].az
+                );
+            }
 
-        // Velocity / Position Integration
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < num_stars; ++i) {
-            stars[i].vx += accels[i].ax * dt;
-            stars[i].vy += accels[i].ay * dt;
-            stars[i].vz += accels[i].az * dt;
+            // Velocity / Position Integration
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < num_stars; ++i) {
+                stars[i].vx += accels[i].ax * dt;
+                stars[i].vy += accels[i].ay * dt;
+                stars[i].vz += accels[i].az * dt;
 
-            stars[i].x += stars[i].vx * dt;
-            stars[i].y += stars[i].vy * dt;
-            stars[i].z += stars[i].vz * dt;
+                stars[i].x += stars[i].vx * dt;
+                stars[i].y += stars[i].vy * dt;
+                stars[i].z += stars[i].vz * dt;
+            }
         }
 
         // Render
-        update_vbo(stars, num_stars);
+        if (!use_gpu) {
+            update_vbo(stars, num_stars);
+        }
         render_frame(num_stars);
         
         glfwSwapBuffers(window);
@@ -407,15 +523,34 @@ int main(int argc, char** argv) {
         }
         frame_count++;
     }
+
+    #ifndef MODE_BAKE
     cleanup_opengl();
+    if (use_gpu) {
+        cuda_unregister_vbo();
+    }
+    #endif
 #endif
+
+    if (use_gpu) {
+        cuda_cleanup();
+    }
 
     delete[] leaf_star_indices;
     delete[] node_masses;
     delete[] node_com_x;
     delete[] node_com_y;
     delete[] node_com_z;
+
+    #ifndef MODE_PLAYBACK
+    if (use_gpu) {
+        cuda_free_pinned_stars(stars);
+    } else {
+        delete[] stars;
+    }
+    #else
     delete[] stars;
+    #endif
 
     return 0;
 }

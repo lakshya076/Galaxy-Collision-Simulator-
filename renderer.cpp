@@ -233,3 +233,7 @@ void cleanup_opengl() {
     glDeleteProgram(shaderProgram);
     glfwTerminate();
 }
+
+unsigned int get_vbo_handle() {
+    return VBO;
+}

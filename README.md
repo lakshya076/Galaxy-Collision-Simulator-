@@ -75,42 +75,76 @@ The parser and database used to process and parse real star catalogs into binary
 ## 🚀 Getting Started
 
 ### Prerequisites
+
+#### For CPU-Only (GCC) Build:
 * A C++17 compliant compiler (e.g., `g++` on Linux or MSYS2/MinGW64 on Windows).
 * OpenMP support.
-* Modern OpenGL development libraries.
+* Modern OpenGL development libraries (GLFW, GLEW, GLM).
 
-On MSYS2 (Windows), install the dependencies:
+#### For GPU-Accelerated (CUDA) Build:
+* **NVIDIA GPU** with CUDA support.
+* **NVIDIA CUDA Toolkit** (containing the `nvcc` compiler).
+* **Microsoft Visual Studio (MSVC)**: On Windows, `nvcc` strictly requires the MSVC host compiler (`cl.exe`) to preprocess host-side code.
+* Modern OpenGL development libraries (GLFW, GLEW, GLM).
+
+On MSYS2 (Windows), install the OpenGL dependencies:
 ```bash
 pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-glfw mingw-w64-x86_64-glew mingw-w64-x86_64-glm
 ```
 
+---
+
 ### Compiling and Running
 
-This simulator is split into three decoupled execution modes, allowing you to bake incredibly heavy physics offline and play them back later in real-time.
+This simulator is split into three decoupled execution modes, allowing you to bake incredibly heavy physics offline and play them back later in real-time. You can compile either the GPU-accelerated version (utilizing CUDA) or the CPU-only version (utilizing OpenMP).
 
-#### 1. Live Mode (Normal)
-Runs the physics engine and immediately renders each frame. Best for moderate particle counts.
-```bash
-g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o main.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+> [!IMPORTANT]
+> **Customizing Paths for Your Machine:**
+> You **must** adjust the folder paths in the compilation commands below to match your local installation:
+> 1. `-ccbin "D:\VisualStudio\VC\Tools\MSVC\..."`: Point this to the absolute directory containing your local MSVC host compiler `cl.exe`.
+> 2. `-I"C:\msys64\mingw64\include"` and library paths (`"C:\msys64\mingw64\lib\libglfw3.dll.a"` / `"C:\msys64\mingw64\lib\libglew32.dll.a"`): Point these to your local MinGW or header/library folder where GLFW, GLEW, and GLM are installed.
+> 3. `-arch=sm_86`: Adjust to target your GPU's actual Compute Capability architecture (e.g., `sm_86` for Ampere/RTX 30xx, `sm_89` for Ada Lovelace/RTX 40xx, `sm_75` for Turing/RTX 20xx).
 
-$env:PATH += ";C:\msys64\mingw64\bin"; .\main.exe
-```
+#### 1. Live Mode (Normal Simulation & Render)
+Runs the physics engine and immediately renders each frame. Best for real-time visualization of moderate to large particle counts.
+* **GPU CUDA Build (Recommended):**
+  ```bash
+  nvcc -O3 -arch=sm_86 -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o simulator_gpu.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
+  $env:PATH += ";C:\msys64\mingw64\bin"; .\simulator_gpu.exe
+  ```
+  *(Pass the `--cpu` argument at runtime to bypass the GPU and run on OpenMP CPU fallback.)*
+* **CPU-Only GCC Build:**
+  ```bash
+  g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o main_cpu.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+  $env:PATH += ";C:\msys64\mingw64\bin"; .\main_cpu.exe
+  ```
 
-#### 2. Bake Mode (Offline)
-Runs purely in the terminal. OpenGL is disabled. Calculates physics as fast as possible and dumps the visible stars (excluding dark matter macro-particles) in the compact 16-byte `PlaybackStar` format directly to `simulation.bin` using massive block writes. For a 1000 frame bake, this file reaches around **3.2 GB** in size (down from the uncompressed **9.2 GB** thanks to dark matter filtering and attribute stripping).
-```bash
-g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_BAKE .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o bake.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+#### 2. Bake Mode (Offline Physics Baker)
+Calculates physics as fast as possible in the terminal (window rendering is disabled) and dumps the visible stars to `simulation.bin` using the compact 16-byte `PlaybackStar` format. For a 1000 frame bake, this file reaches around **3.2 GB** in size (down from the uncompressed **9.2 GB** thanks to dark matter filtering and attribute stripping).
+* **GPU CUDA Build (Recommended):**
+  ```bash
+  nvcc -O3 -arch=sm_86 -DMODE_BAKE -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o bake_gpu.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
+  .\bake_gpu.exe <num_frames>
+  ```
+  *(Pass `--cpu` as the second argument, e.g. `.\bake_gpu.exe 1000 --cpu`, to bake using the CPU engine.)*
+* **CPU-Only GCC Build:**
+  ```bash
+  g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_BAKE .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o bake_cpu.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+  .\bake_cpu.exe <num_frames>
+  ```
 
-.\bake.exe
-```
-
-#### 3. Playback Mode (Viewer)
-Disables the physics engine. Initializes OpenGL and rapidly streams frames from `simulation.bin` directly into the VRAM, allowing you to scrub through insanely heavy physics calculations at 60-144 FPS.
-```bash
-g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_PLAYBACK .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o play.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
-
-$env:PATH += ";C:\msys64\mingw64\bin"; .\play.exe
-```
+#### 3. Playback Mode (Zero-Physics Viewer)
+Disables the physics engine entirely. Initializes OpenGL and rapidly streams the pre-baked frames from `simulation.bin` directly into the VRAM at 60-144 FPS.
+* **GPU CUDA Build (Recommended):**
+  ```bash
+  nvcc -O3 -arch=sm_86 -DMODE_PLAYBACK -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o play_gpu.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
+  $env:PATH += ";C:\msys64\mingw64\bin"; .\play_gpu.exe
+  ```
+* **CPU-Only GCC Build:**
+  ```bash
+  g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_PLAYBACK .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o play_cpu.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
+  $env:PATH += ";C:\msys64\mingw64\bin"; .\play_cpu.exe
+  ```
 
 ### Controls (Live & Playback Mode)
 - **Mouse Look:** Pitch and Yaw rotation.

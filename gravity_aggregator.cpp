@@ -1,5 +1,10 @@
 #include "gravity_aggregator.h"
 
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#define __builtin_prefetch(addr, rw, locality) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+#endif
+
 void query_gravity(
     const OctreeNode* root,
     const Star& star,

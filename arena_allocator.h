@@ -73,4 +73,8 @@ public:
     size_t get_used_memory() const {
         return offset;
     }
+
+    void* get_base_ptr() const {
+        return buffer;
+    }
 };

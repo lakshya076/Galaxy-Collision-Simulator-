@@ -9,3 +9,4 @@ void setup_buffers(const Star* stars, size_t num_stars);
 void update_vbo(const Star* stars, size_t num_stars);
 void render_frame(size_t num_stars);
 void cleanup_opengl();
+unsigned int get_vbo_handle();
