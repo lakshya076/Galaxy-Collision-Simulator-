@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
     
     Star* stars = new Star[total_particles];
     int num_stars = total_particles;
+    int num_visible = 2 * (num_disc + num_bulge);
 
     mt19937 global_rng(std::random_device{}());
 
@@ -41,7 +42,7 @@ int main(int argc, char** argv) {
     auto end_time = chrono::high_resolution_clock::now();
     chrono::duration<double> diff = end_time - start_time;
 
-    cout << "Collision scenario generated successfully!" << std::endl;
+    cout << "Collision scenario generated successfully" << std::endl;
     cout << "Total stars spawned: " << total_particles << std::endl;
     
 #ifndef MODE_BAKE
@@ -51,7 +52,6 @@ int main(int argc, char** argv) {
         return -1;
     }
     #if defined(MODE_PLAYBACK)
-        int num_visible = 2 * (num_disc + num_bulge);
         setup_buffers(stars, num_visible);
     #else
         setup_buffers(stars, num_stars);
@@ -192,32 +192,126 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    int num_visible = 2 * (num_disc + num_bulge);
     std::vector<PlaybackStar> read_buffer(num_visible);
+
+    bool is_paused = false;
+    bool space_was_pressed = false;
+
+    struct KeyState {
+        int key;
+        double press_start_time = 0.0;
+        double last_trigger_time = 0.0;
+        bool was_pressed = false;
+    };
+    
+    KeyState key_up{GLFW_KEY_UP};
+    KeyState key_down{GLFW_KEY_DOWN};
+    KeyState key_left{GLFW_KEY_LEFT};
+    KeyState key_right{GLFW_KEY_RIGHT};
+
+    double target_fps = 60.0;
+    double last_update_time = glfwGetTime();
+
+    auto check_key_trigger = [&](KeyState& state, double current_time, double repeat_delay, double initial_delay = 0.25) -> bool {
+        bool is_pressed = (glfwGetKey(window, state.key) == GLFW_PRESS);
+        bool triggered = false;
+        
+        if (is_pressed) {
+            if (!state.was_pressed) {
+                state.press_start_time = current_time;
+                state.last_trigger_time = current_time;
+                triggered = true;
+            } else {
+                double hold_duration = current_time - state.press_start_time;
+                if (hold_duration >= initial_delay) {
+                    double time_since_last_trigger = current_time - state.last_trigger_time;
+                    if (time_since_last_trigger >= repeat_delay) {
+                        state.last_trigger_time = current_time;
+                        triggered = true;
+                    }
+                }
+            }
+        }
+        state.was_pressed = is_pressed;
+        return triggered;
+    };
 
     while (!glfwWindowShouldClose(window)) {
         process_input(window);
 
-        size_t read_elements = fread(read_buffer.data(), sizeof(PlaybackStar), num_visible, in_file);
-        if (read_elements != num_visible) {
-            // Loop playback if EOF reached
-            fseek(in_file, 0, SEEK_SET);
-            fread(read_buffer.data(), sizeof(PlaybackStar), num_visible, in_file);
+        double current_time = glfwGetTime();
+
+        // Control Keys
+        bool space_is_pressed = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
+        if (space_is_pressed && !space_was_pressed) {
+            is_paused = !is_paused;
+            cout << (is_paused ? "PAUSED" : "PLAYING") << " (Speed: " << target_fps << " FPS)" << endl;
+        }
+        space_was_pressed = space_is_pressed;
+
+        if (check_key_trigger(key_up, current_time, 0.05)) {
+            target_fps = std::min(240.0, target_fps + 5.0);
+            cout << "Speed increased to: " << target_fps << " FPS" << endl;
         }
 
-        // Copy positions and colors to stars array for rendering
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < num_visible; ++i) {
-            stars[i].x = read_buffer[i].x;
-            stars[i].y = read_buffer[i].y;
-            stars[i].z = read_buffer[i].z;
-            stars[i].r = read_buffer[i].r;
-            stars[i].g = read_buffer[i].g;
-            stars[i].b = read_buffer[i].b;
-            stars[i].is_dm = false;
+        if (check_key_trigger(key_down, current_time, 0.05)) {
+            target_fps = std::max(5.0, target_fps - 5.0);
+            cout << "Speed decreased to: " << target_fps << " FPS" << endl;
         }
 
-        update_vbo(stars, num_visible);
+        bool step_forward = check_key_trigger(key_right, current_time, 0.03);
+        bool step_backward = check_key_trigger(key_left, current_time, 0.03);
+
+        // Determine if we should update to next frame
+        double elapsed = current_time - last_update_time;
+        bool should_update_frame = false;
+
+        if (!is_paused) {
+            if (elapsed >= (1.0 / target_fps)) {
+                should_update_frame = true;
+                last_update_time = current_time;
+            }
+        } else {
+            if (step_forward) {
+                should_update_frame = true;
+            } else if (step_backward) {
+                long frame_size = num_visible * sizeof(PlaybackStar);
+                long current_pos = ftell(in_file);
+                long new_pos = current_pos - 2 * frame_size;
+                if (new_pos < 0) {
+                    // Loop to end
+                    fseek(in_file, 0, SEEK_END);
+                    long file_size = ftell(in_file);
+                    new_pos = file_size - frame_size;
+                }
+                fseek(in_file, new_pos, SEEK_SET);
+                should_update_frame = true;
+            }
+        }
+
+        if (should_update_frame) {
+            size_t read_elements = fread(read_buffer.data(), sizeof(PlaybackStar), num_visible, in_file);
+            if (read_elements != num_visible) {
+                // Loop playback if EOF reached
+                fseek(in_file, 0, SEEK_SET);
+                fread(read_buffer.data(), sizeof(PlaybackStar), num_visible, in_file);
+            }
+
+            // Copy positions and colors to stars array for rendering
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < num_visible; ++i) {
+                stars[i].x = read_buffer[i].x;
+                stars[i].y = read_buffer[i].y;
+                stars[i].z = read_buffer[i].z;
+                stars[i].r = read_buffer[i].r;
+                stars[i].g = read_buffer[i].g;
+                stars[i].b = read_buffer[i].b;
+                stars[i].is_dm = false;
+            }
+
+            update_vbo(stars, num_visible);
+        }
+
         render_frame(num_visible);
         
         glfwSwapBuffers(window);

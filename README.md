@@ -117,4 +117,7 @@ $env:PATH += ";C:\msys64\mingw64\bin"; .\play.exe
 - **W / S:** Move Forward / Backward.
 - **A / D:** Strafe Left / Right.
 - **Mouse Scroll:** Fast Forward / Backward Zoom.
+- **SPACE:** Pause / Resume playback (Playback mode only).
+- **UP / DOWN:** Increase / Decrease speed (target FPS) (Playback mode only).
+- **LEFT / RIGHT:** Step 1 frame Backward / Forward (when paused in Playback mode).
 - **ESC:** Exit Simulation.
