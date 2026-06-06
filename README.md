@@ -97,7 +97,7 @@ $env:PATH += ";C:\msys64\mingw64\bin"; .\main.exe
 ```
 
 #### 2. Bake Mode (Offline)
-Runs purely in the terminal. OpenGL is disabled. Calculates physics as fast as possible and dumps the raw `Star` memory array (32-bytes per particle) directly to `simulation.bin` using massive block writes. Keep in mind for 1000 frame bake, this file reaches around **9.2gb** in size.
+Runs purely in the terminal. OpenGL is disabled. Calculates physics as fast as possible and dumps the visible stars (excluding dark matter macro-particles) in the compact 16-byte `PlaybackStar` format directly to `simulation.bin` using massive block writes. For a 1000 frame bake, this file reaches around **3.2 GB** in size (down from the uncompressed **9.2 GB** thanks to dark matter filtering and attribute stripping).
 ```bash
 g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_BAKE .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o bake.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
 
