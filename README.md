@@ -6,17 +6,18 @@ A high-performance, custom-built 3D Galaxy Collision Simulator written in pure C
 
 ## Project Overview & Roadmap
 
-This project is built incrementally following a rigorous engineering roadmap:
+This project is built incrementally following the roadmap:
 
-- **Phase 1-4: Foundation & Spatial DB Integration** - Standardized particle representations, memory pooling, and importing stellar catalogs from spatial data sources. This was completed in another project first stored as **[Spatial_DB Repository](https://github.com/lakshya076/Spatial_DB)**
-- **Phase 5: Initial Conditions Generator** - Mathematical generation of stable galaxies using
+- **Foundation & Spatial DB Integration** - Standardized particle representations, memory pooling, and importing stellar catalogs from spatial data sources. This was completed in another project first stored as **[Spatial_DB Repository](https://github.com/lakshya076/Spatial_DB)**. The full data is stored in the Octree format to optimize Barnes-Hut later.
+- **Initial Conditions Generator** - Mathematical generation of stable galaxies using
   - Miyamoto-Nagai stellar discs
   - Hernquist bulges
   - Dark Matter Halos
-- **Phase 6: Barnes-Hut Physics Core** - Bottom-up mass aggregation and fast gravitational force calculation using the $\theta = \frac{s}{d}$ approximation.
-- **Phase 7: The Master Simulation Loop** - Main temporal integration loop connecting the octree structures with Newtonian physics over time steps ($\Delta t$).
-- **Phase 8: Live OpenGL Graphics Pipeline** - Real-time visualization using GLFW/GLEW with a free-flying WASD camera. The unified `Star` memory layout streams directly into OpenGL Vertex Buffer Objects (VBOs) with zero overhead.
-- **Phase 9: Offline Physics Baking** - Decoupling the engine into a background Physics Baker (dumps binary data to SSD) and a GPU Playback Viewer for 144+ FPS scrubbing of extremely heavy simulations.
+- **Barnes-Hut Gravity Approximation and Leapfrog Integration** - Bottom-up mass aggregation and fast gravitational force calculation using the $\theta = \frac{s}{d}$ approximation.
+- **Master Simulation Loop** - Main temporal integration loop connecting the octree structures with Newtonian physics over time steps ($\Delta t$).
+- **Live OpenGL Graphics Pipeline** - Real-time visualization using GLFW/GLEW with a free-flying WASD camera. The `PlaybackStar` memory layout streams directly into OpenGL Vertex Buffer Objects (VBOs) with zero overhead.
+- **Offline Physics Baking** - Decoupling the engine into a background Physics Baker (dumps binary data to SSD) and a GPU Playback Viewer for an adjustable FPS viewing of extremely heavy simulations.
+- **GPU/CUDA Optimization** - CPU based simulation cost around 2 seconds per frame generation. CUDA optimizations were made to run the heavy compute directly onto the GPU to reduce this time to ~0.4 seconds per frame generation.
 
 ---
 
@@ -35,7 +36,7 @@ Instead of standard dynamic allocations (`new`/`delete`) which cause memory frag
 ### 3. The Indirection Array
 Instead of limiting leaf nodes to a small array of stars, the engine uses a global Indirection Array. Leaf nodes store a 32-bit `start_star_index`, allowing them to hold up to 32 stars without increasing the node struct size. This keeps the octree incredibly shallow, eliminating pointer-chasing latency.
 
-### 4. Unified Star Struct (Array of Structures)
+### 4. Star Struct (Array of Structures)
 All stellar particles (visible disc stars, bulge stars, and dark matter macro-particles) are stored in a unified flat array:
 ```cpp
 struct Star {
@@ -54,7 +55,7 @@ Because the `OctreeNode` cannot exceed 32 bytes, all node-level physics data (su
 * **Manual L1 Memory Prefetching:** The hottest direct-gravity math loop utilizes compiler intrinsics (`__builtin_prefetch`) to actively pull the *next* star's data into the L1 cache while the FPU computes the inverse square root math for the *current* star.
 
 ### 7. GPU CUDA Architecture
-* **Structure of Arrays (SoA):** Before launching the physics kernels, the unified `Star` array (AoS) is transposed into separate parallel arrays (`d_x`, `d_y`, `d_z`, etc.) in VRAM. This guarantees perfectly coalesced memory access across 32-thread warps.
+* **Structure of Arrays (SoA):** Before launching the physics kernels, the `Star` array (AoS) is transposed into separate parallel arrays (`d_x`, `d_y`, `d_z`, etc.) in VRAM. This guarantees perfectly coalesced memory access across 32-thread warps.
 * **Non-Recursive Octree Traversal:** The GPU traverses the Barnes-Hut octree using a highly optimized iterative stack stored locally per-thread. This avoids recursive function calls which would otherwise cause massive local memory allocation and slow down the GPU.
 * **Zero-Copy VBO Interop:** In Live mode, CUDA registers and maps the OpenGL Vertex Buffer Objects (VBOs) directly. The calculated physics positions are written straight into the graphics memory buffer. This eliminates the need to transfer the positions back to the CPU over the PCIe bus to render them, massively improving framerates.
 
@@ -82,14 +83,15 @@ The parser and database used to process and parse real star catalogs into binary
 ### Prerequisites
 
 #### For CPU-Only (GCC) Build:
-* A C++17 compliant compiler (e.g., `g++` on Linux or MSYS2/MinGW64 on Windows).
+* Windows 11
+* A C++17 compliant compiler (e.g., `g++` on Linux or [MSYS2](https://www.msys2.org/)/MinGW64 on Windows).
 * OpenMP support.
 * Modern OpenGL development libraries (GLFW, GLEW, GLM).
 
 #### For GPU-Accelerated (CUDA) Build:
 * **NVIDIA GPU** with CUDA support.
-* **NVIDIA CUDA Toolkit** (containing the `nvcc` compiler).
-* **Microsoft Visual Studio (MSVC)**: On Windows, `nvcc` strictly requires the MSVC host compiler (`cl.exe`) to preprocess host-side code.
+* **NVIDIA CUDA Toolkit** (containing the `nvcc` compiler). [Download Here](https://developer.nvidia.com/cuda-downloads)
+* **Microsoft Visual Studio (MSVC)**: On Windows, `nvcc` strictly requires the MSVC host compiler (`cl.exe`) to preprocess host-side code. [Download Here](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
 * Modern OpenGL development libraries (GLFW, GLEW, GLM).
 
 On MSYS2 (Windows), install the OpenGL dependencies:
