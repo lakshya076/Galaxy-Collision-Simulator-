@@ -431,9 +431,18 @@ int main(int argc, char** argv) {
                 stars[i].b = read_buffer[i].b;
                 stars[i].type = read_buffer[i].padding;
             }
-
-            update_vbo(stars, num_stars);
+            if (use_gpu) {
+                update_vbo(stars, num_stars);
+            }
         }
+
+        float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+        double sum_x = 0, sum_y = 0, sum_z = 0;
+        for (int i=0; i<num_stars; i++) {
+            sum_x += stars[i].x; sum_y += stars[i].y; sum_z += stars[i].z;
+        }
+        cx = sum_x/num_stars; cy = sum_y/num_stars; cz = sum_z/num_stars;
+        set_camera_target(cx, cy, cz);
 
         render_frame(num_stars);
         
@@ -540,6 +549,19 @@ int main(int argc, char** argv) {
         if (!use_gpu) {
             update_vbo(stars, num_stars);
         }
+
+        float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+        if (use_gpu) {
+            cuda_get_center_of_mass(&cx, &cy, &cz);
+        } else {
+            double sum_x = 0, sum_y = 0, sum_z = 0;
+            for (int i=0; i<num_stars; i++) {
+                sum_x += stars[i].x; sum_y += stars[i].y; sum_z += stars[i].z;
+            }
+            cx = sum_x/num_stars; cy = sum_y/num_stars; cz = sum_z/num_stars;
+        }
+        set_camera_target(cx, cy, cz);
+
         render_frame(num_stars);
         
         glfwSwapBuffers(window);

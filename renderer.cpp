@@ -16,6 +16,19 @@ float pitch = -10.0f;
 float lastX =  1920.0f / 2.0;
 float lastY =  1080.0 / 2.0;
 
+bool camera_locked = false;
+glm::vec3 camera_target(0.0f, 0.0f, 0.0f);
+
+void toggle_camera_lock() {
+    camera_locked = !camera_locked;
+    if (camera_locked) std::cout << "Camera Locked to Center of Mass" << std::endl;
+    else std::cout << "Camera Free" << std::endl;
+}
+
+void set_camera_target(float cx, float cy, float cz) {
+    camera_target = glm::vec3(cx, cy, cz);
+}
+
 // Timing
 float deltaTime = 0.0f;
 float lastFrame = 0.0f;
@@ -42,6 +55,8 @@ void mouse_callback(GLFWwindow* window, double xposIn, double yposIn) {
     yaw += xoffset;
     pitch += yoffset;
 
+    if (camera_locked) return; // Prevent free-look when locked
+
     if (pitch > 89.0f) pitch = 89.0f;
     if (pitch < -89.0f) pitch = -89.0f;
 
@@ -59,6 +74,11 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
 void process_input(GLFWwindow* window) {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
+
+    static bool l_was_pressed = false;
+    bool l_is_pressed = glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS;
+    if (l_is_pressed && !l_was_pressed) toggle_camera_lock();
+    l_was_pressed = l_is_pressed;
 
     float cameraSpeed = 500.0f * deltaTime;
     if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
@@ -231,6 +251,14 @@ void render_frame(size_t num_stars) {
     glUseProgram(shaderProgram);
     
     glm::mat4 model = glm::mat4(1.0f);
+    
+    if (camera_locked) {
+        cameraFront = glm::normalize(camera_target - cameraPos);
+        // Synchronize yaw and pitch so free-look resumes smoothly
+        pitch = glm::degrees(asin(cameraFront.y));
+        yaw = glm::degrees(atan2(cameraFront.z, cameraFront.x));
+    }
+    
     glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
     glm::mat4 projection = glm::perspective(glm::radians(45.0f), 1920.0f / 1080.0f, 0.1f, 5000.0f);
     

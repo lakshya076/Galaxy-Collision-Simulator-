@@ -356,10 +356,23 @@ void cuda_register_vbo(unsigned int vbo_id) {
 }
 
 void cuda_unregister_vbo() {
-    if (cuda_vbo_resource) {
+    if (cuda_vbo_resource != nullptr) {
         cudaGraphicsUnregisterResource(cuda_vbo_resource);
         cuda_vbo_resource = nullptr;
     }
+}
+
+void cuda_get_center_of_mass(float* cx, float* cy, float* cz) {
+    if (!d_bvh_nodes_tr) {
+        *cx = 0; *cy = 0; *cz = 0;
+        return;
+    }
+    BvhNodeTraverse root;
+    
+    cudaMemcpy(&root, d_bvh_nodes_tr, sizeof(BvhNodeTraverse), cudaMemcpyDeviceToHost);
+    *cx = root.com_x;
+    *cy = root.com_y;
+    *cz = root.com_z;
 }
 
 // Executes one simulation frame natively on the GPU

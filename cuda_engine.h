@@ -17,6 +17,7 @@ void cuda_upload_initial_stars(const Star* host_stars, int num_stars);
 // OpenGL GL-CUDA Resource Registration
 void cuda_register_vbo(unsigned int vbo_id);
 void cuda_unregister_vbo();
+void cuda_get_center_of_mass(float* cx, float* cy, float* cz);
 
 // Physics Step
 float cuda_physics_step(
