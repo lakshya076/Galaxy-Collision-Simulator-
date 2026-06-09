@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
         return -1;
     }
     #if defined(MODE_PLAYBACK)
-        setup_buffers(stars, num_visible);
+        setup_buffers(stars, num_stars);
     #else
         setup_buffers(stars, num_stars);
         if (use_gpu) {
@@ -134,11 +134,11 @@ int main(int argc, char** argv) {
     PlaybackStar* host_buf_A = nullptr;
     PlaybackStar* host_buf_B = nullptr;
     if (use_gpu) {
-        cuda_allocate_pinned_playback(&host_buf_A, num_visible);
-        cuda_allocate_pinned_playback(&host_buf_B, num_visible);
+        cuda_allocate_pinned_playback(&host_buf_A, num_stars);
+        cuda_allocate_pinned_playback(&host_buf_B, num_stars);
     } else {
-        host_buf_A = new PlaybackStar[num_visible];
-        host_buf_B = new PlaybackStar[num_visible];
+        host_buf_A = new PlaybackStar[num_stars];
+        host_buf_B = new PlaybackStar[num_stars];
     }
 
     std::thread writer_thread;
@@ -259,9 +259,7 @@ int main(int argc, char** argv) {
 
         int local_write_count = 0;
         for (int i = 0; i < num_stars; ++i) {
-            if (!stars[i].is_dm) {
-                current_write_buf[local_write_count++] = {stars[i].x, stars[i].y, stars[i].z, stars[i].r, stars[i].g, stars[i].b, 0};
-            }
+            current_write_buf[local_write_count++] = {stars[i].x, stars[i].y, stars[i].z, stars[i].r, stars[i].g, stars[i].b, stars[i].type};
         }
 
         // Launch background thread to write this frame to SSD
@@ -295,14 +293,25 @@ int main(int argc, char** argv) {
     }
 
 #elif defined(MODE_PLAYBACK)
-    cout << "Reading from simulation.bin..." << endl;
+    long long file_size = 0;
+    int num_playback_stars = 0;
+    
     FILE* in_file = fopen("simulation.bin", "rb");
-    if (!in_file) {
-        cerr << "Failed to open simulation.bin! Run BAKE mode first." << endl;
-        return -1;
+    if (in_file) {
+        fseek(in_file, 0, SEEK_END);
+        file_size = _ftelli64(in_file);
+        fseek(in_file, 0, SEEK_SET);
+        // We know we baked 2000 frames
+        num_playback_stars = (file_size / 2000) / sizeof(PlaybackStar);
+    } else {
+        std::cerr << "simulation.bin not found! Please run bake.exe first." << std::endl;
+        return 1;
     }
+    
+    // Override num_stars to the actual number of stars baked per frame
+    num_stars = num_playback_stars;
 
-    std::vector<PlaybackStar> read_buffer(num_visible);
+    std::vector<PlaybackStar> read_buffer(num_stars);
 
     bool is_paused = false;
     bool space_was_pressed = false;
@@ -385,7 +394,7 @@ int main(int argc, char** argv) {
             if (step_forward) {
                 should_update_frame = true;
             } else if (step_backward) {
-                long frame_size = num_visible * sizeof(PlaybackStar);
+                long frame_size = num_stars * sizeof(PlaybackStar);
                 long current_pos = ftell(in_file);
                 long new_pos = current_pos - 2 * frame_size;
                 if (new_pos < 0) {
@@ -400,29 +409,29 @@ int main(int argc, char** argv) {
         }
 
         if (should_update_frame) {
-            size_t read_elements = fread(read_buffer.data(), sizeof(PlaybackStar), num_visible, in_file);
-            if (read_elements != num_visible) {
+            size_t read_elements = fread(read_buffer.data(), sizeof(PlaybackStar), num_stars, in_file);
+            if (read_elements != num_stars) {
                 // Loop playback if EOF reached
                 fseek(in_file, 0, SEEK_SET);
-                fread(read_buffer.data(), sizeof(PlaybackStar), num_visible, in_file);
+                fread(read_buffer.data(), sizeof(PlaybackStar), num_stars, in_file);
             }
 
             // Copy positions and colors to stars array for rendering
             #pragma omp parallel for schedule(static)
-            for (int i = 0; i < num_visible; ++i) {
+            for (int i = 0; i < num_stars; ++i) {
                 stars[i].x = read_buffer[i].x;
                 stars[i].y = read_buffer[i].y;
                 stars[i].z = read_buffer[i].z;
                 stars[i].r = read_buffer[i].r;
                 stars[i].g = read_buffer[i].g;
                 stars[i].b = read_buffer[i].b;
-                stars[i].is_dm = false;
+                stars[i].type = read_buffer[i].padding;
             }
 
-            update_vbo(stars, num_visible);
+            update_vbo(stars, num_stars);
         }
 
-        render_frame(num_visible);
+        render_frame(num_stars);
         
         glfwSwapBuffers(window);
         glfwPollEvents();

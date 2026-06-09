@@ -77,34 +77,54 @@ GLuint VAO, VBO;
 const char* vertexShaderSource = R"glsl(
     #version 330 core
     layout (location = 0) in vec3 aPos;
-    layout (location = 1) in float aIsDm; // bool passed as generic float or byte
+    layout (location = 1) in float aType; // uint8_t mapped to float
     layout (location = 2) in vec3 aColor; // RGB color normalized to 0.0 - 1.0
     
     uniform mat4 model;
     uniform mat4 view;
     uniform mat4 projection;
     
-    out float is_dm;
+    out float type_val;
     out vec3 starColor;
     
     void main() {
-        gl_Position = projection * view * model * vec4(aPos, 1.0);
-        is_dm = aIsDm;
+        vec4 viewSpacePos = view * model * vec4(aPos, 1.0);
+        gl_Position = projection * viewSpacePos;
+        type_val = aType;
         starColor = aColor;
+        
+        float dist = length(viewSpacePos.xyz);
+        if (aType == 1.0) {
+            gl_PointSize = clamp(2500.0 / dist, 1.0, 6.0); // Puffy dark matter
+        } else {
+            gl_PointSize = clamp(1000.0 / dist, 1.0, 3.0); // Sharp stars
+        }
     }
 )glsl";
 
 const char* fragmentShaderSource = R"glsl(
     #version 330 core
-    in float is_dm;
+    in float type_val;
     in vec3 starColor;
     out vec4 FragColor;
     
     void main() {
-        if (is_dm > 0.5) {
-            discard; // Don't draw dark matter
+        vec2 coord = gl_PointCoord * 2.0 - 1.0;
+        float distSq = dot(coord, coord);
+        
+        if (distSq > 1.0) {
+            discard;
         }
-        FragColor = vec4(starColor, 0.8); 
+        
+        float alpha = exp(-distSq * 3.0);
+        
+        if (type_val == 1.0) {
+            // Faint deep purple for dark matter
+            FragColor = vec4(0.4, 0.0, 0.8, alpha * 0.03); 
+        } else {
+            // Lower intensity to prevent dense clusters from blowing out to white
+            FragColor = vec4(starColor, alpha * 0.15); 
+        }
     }
 )glsl";
 
@@ -160,8 +180,9 @@ GLFWwindow* init_opengl(int width, int height) {
     glDeleteShader(fragmentShader);
     
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE); // Additive blending for glowing stars
+    glEnable(GL_PROGRAM_POINT_SIZE);
+
     // Register input callbacks and capture mouse
     glfwSetCursorPosCallback(window, mouse_callback);
     glfwSetScrollCallback(window, scroll_callback);
@@ -184,8 +205,7 @@ void setup_buffers(const Star* stars, size_t num_stars) {
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Star), (void*)0);
     glEnableVertexAttribArray(0);
     
-    // Map 'is_dm' bool as a single unsigned byte mapped to a float in shader
-    glVertexAttribPointer(1, 1, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(Star), (void*)offsetof(Star, is_dm));
+    glVertexAttribPointer(1, 1, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(Star), (void*)offsetof(Star, type));
     glEnableVertexAttribArray(1);
 
     // Color attribute (GL_TRUE normalizes the uint8_t 0-255 into a float 0.0-1.0 automatically)

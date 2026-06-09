@@ -45,10 +45,10 @@ __global__ void apply_sorted_indices_kernel(
     const int* sorted_indices,
     const float* in_x, const float* in_y, const float* in_z,
     const float* in_vx, const float* in_vy, const float* in_vz,
-    const float* in_mass, const uint8_t* in_r, const uint8_t* in_g, const uint8_t* in_b, const bool* in_is_dm,
+    const float* in_mass, const uint8_t* in_r, const uint8_t* in_g, const uint8_t* in_b, const uint8_t* in_type,
     float* out_x, float* out_y, float* out_z,
     float* out_vx, float* out_vy, float* out_vz,
-    float* out_mass, uint8_t* out_r, uint8_t* out_g, uint8_t* out_b, bool* out_is_dm,
+    float* out_mass, uint8_t* out_r, uint8_t* out_g, uint8_t* out_b, uint8_t* out_type,
     int num_stars
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -66,7 +66,7 @@ __global__ void apply_sorted_indices_kernel(
     out_r[i] = in_r[sorted_idx];
     out_g[i] = in_g[sorted_idx];
     out_b[i] = in_b[sorted_idx];
-    out_is_dm[i] = in_is_dm[sorted_idx];
+    out_type[i] = in_type[sorted_idx];
 }
 
 // Karras Tree Builder

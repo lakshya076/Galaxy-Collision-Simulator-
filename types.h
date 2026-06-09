@@ -7,7 +7,7 @@ struct Star {
     float vx, vy, vz;
     float mass;
 
-    bool is_dm;
+    uint8_t type;
     uint8_t r, g, b;
 }; 
 

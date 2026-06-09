@@ -42,7 +42,7 @@ void spawn_disc(Star* stars, int& current_index, int num, std::mt19937& rng, uin
             stars[current_index].z = z;
 
             stars[current_index].mass = particle_mass;
-            stars[current_index].is_dm = false;
+            stars[current_index].type = 0; // Galaxy A or generic disc
             stars[current_index].r = col_r;
             stars[current_index].g = col_g;
             stars[current_index].b = col_b;
@@ -86,7 +86,7 @@ void spawn_bulge(Star* stars, int& current_index, int num, std::mt19937& rng, ui
         stars[current_index].z = r * cos_phi;
 
         stars[current_index].mass = particle_mass; 
-        stars[current_index].is_dm = false; 
+        stars[current_index].type = 0; // Galaxy A or generic bulge 
         stars[current_index].r = col_r;
         stars[current_index].g = col_g;
         stars[current_index].b = col_b;
@@ -132,7 +132,7 @@ void spawn_dark_matter(Star* stars, int& current_index, int num, std::mt19937& r
         stars[current_index].z = r * cos_phi;
         
         stars[current_index].mass = particle_mass; 
-        stars[current_index].is_dm = true; 
+        stars[current_index].type = 1; // Dark Matter 
         stars[current_index].r = 0;
         stars[current_index].g = 0;
         stars[current_index].b = 0;
@@ -181,9 +181,9 @@ void initial_setup(Star* stars, int num_dark_matter, int num_disc, int num_bulge
         stars[i].x += 500.0f;
         stars[i].vx -= 50.0f;
         
-        // Recolor Galaxy B (Cool Palette)
         int local_idx = i - start_B;
         if (local_idx >= num_dark_matter) {
+            stars[i].type = 2; // Galaxy B
             if (local_idx < num_dark_matter + num_disc) {
                 // Disc
                 stars[i].r = 50; stars[i].g = 100; stars[i].b = 255; // Deep Blue

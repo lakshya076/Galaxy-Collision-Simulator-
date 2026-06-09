@@ -18,14 +18,14 @@ float *d_x, *d_y, *d_z;
 float *d_vx, *d_vy, *d_vz;
 float *d_mass;
 uint8_t *d_r, *d_g, *d_b;
-bool *d_is_dm;
+uint8_t *d_type;
 
 // Double Buffers for Sorting
 float *d_x_alt, *d_y_alt, *d_z_alt;
 float *d_vx_alt, *d_vy_alt, *d_vz_alt;
 float *d_mass_alt;
 uint8_t *d_r_alt, *d_g_alt, *d_b_alt;
-bool *d_is_dm_alt;
+uint8_t *d_type_alt;
 
 float3* d_accels;
 
@@ -54,7 +54,7 @@ __global__ void transpose_aos_to_soa_kernel(
     const Star* in_stars,
     float* x, float* y, float* z,
     float* vx, float* vy, float* vz,
-    float* mass, uint8_t* r, uint8_t* g, uint8_t* b, bool* is_dm,
+    float* mass, uint8_t* r, uint8_t* g, uint8_t* b, uint8_t* type,
     int num_stars
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -65,7 +65,7 @@ __global__ void transpose_aos_to_soa_kernel(
     vx[i] = s.vx; vy[i] = s.vy; vz[i] = s.vz;
     mass[i] = s.mass;
     r[i] = s.r; g[i] = s.g; b[i] = s.b;
-    is_dm[i] = s.is_dm;
+    type[i] = s.type;
 }
 
 // Pack SoA arrays back into Star structs for rendering or host copy
@@ -73,7 +73,7 @@ __global__ void transpose_soa_to_aos_kernel(
     Star* out_stars,
     const float* x, const float* y, const float* z,
     const float* vx, const float* vy, const float* vz,
-    const float* mass, const uint8_t* r, const uint8_t* g, const uint8_t* b, const bool* is_dm,
+    const float* mass, const uint8_t* r, const uint8_t* g, const uint8_t* b, const uint8_t* type,
     int num_stars
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -83,7 +83,7 @@ __global__ void transpose_soa_to_aos_kernel(
     out_stars[i].vx = vx[i]; out_stars[i].vy = vy[i]; out_stars[i].vz = vz[i];
     out_stars[i].mass = mass[i];
     out_stars[i].r = r[i]; out_stars[i].g = g[i]; out_stars[i].b = b[i];
-    out_stars[i].is_dm = is_dm[i];
+    out_stars[i].type = type[i];
 }
 
 // Gravity integration traversal using Binary BVH
@@ -160,6 +160,8 @@ __global__ void query_gravity_bvh_kernel(
 __global__ void integrate_kernel(
     float* x, float* y, float* z,
     float* vx, float* vy, float* vz,
+    uint8_t* r, uint8_t* g, uint8_t* b,
+    const uint8_t* type,
     const float3* accels,
     float dt,
     int num_stars
@@ -174,6 +176,39 @@ __global__ void integrate_kernel(
     x[i] += vx[i] * dt;
     y[i] += vy[i] * dt;
     z[i] += vz[i] * dt;
+    
+    // Dynamic Velocity-Based Coloring
+    if (type[i] == 0) { // Galaxy A (Fire Gradient: Red -> Orange -> Yellow)
+        float speed = sqrtf(vx[i]*vx[i] + vy[i]*vy[i] + vz[i]*vz[i]);
+        float t = fminf(speed / 150.0f, 1.0f);
+        
+        if (t < 0.5f) {
+            float norm_t = t * 2.0f; // 0.0 to 1.0
+            r[i] = 255;
+            g[i] = (uint8_t)(50 + 150 * norm_t); // 50 to 200
+            b[i] = 0;
+        } else {
+            float norm_t = (t - 0.5f) * 2.0f; // 0.0 to 1.0
+            r[i] = 255;
+            g[i] = (uint8_t)(200 + 55 * norm_t); // 200 to 255
+            b[i] = (uint8_t)(150 * norm_t); // 0 to 150
+        }
+    } else if (type[i] == 2) { // Galaxy B (Ice Gradient: Dark Blue -> Cyan -> White)
+        float speed = sqrtf(vx[i]*vx[i] + vy[i]*vy[i] + vz[i]*vz[i]);
+        float t = fminf(speed / 150.0f, 1.0f);
+        
+        if (t < 0.5f) {
+            float norm_t = t * 2.0f; // 0.0 to 1.0
+            r[i] = 0;
+            g[i] = (uint8_t)(100 + 100 * norm_t); // 100 to 200
+            b[i] = 255;
+        } else {
+            float norm_t = (t - 0.5f) * 2.0f; // 0.0 to 1.0
+            r[i] = (uint8_t)(200 * norm_t); // 0 to 200
+            g[i] = (uint8_t)(200 + 55 * norm_t); // 200 to 255
+            b[i] = 255;
+        }
+    }
 }
 
 // Initialization
@@ -201,7 +236,7 @@ bool cuda_init(int num_stars) {
     cudaMalloc(&d_r, num_stars * sizeof(uint8_t));
     cudaMalloc(&d_g, num_stars * sizeof(uint8_t));
     cudaMalloc(&d_b, num_stars * sizeof(uint8_t));
-    cudaMalloc(&d_is_dm, num_stars * sizeof(bool));
+    cudaMalloc(&d_type, num_stars * sizeof(uint8_t));
     
     // Allocate alternate SoA for sorting double-buffering
     cudaMalloc(&d_x_alt, num_stars * sizeof(float));
@@ -214,7 +249,7 @@ bool cuda_init(int num_stars) {
     cudaMalloc(&d_r_alt, num_stars * sizeof(uint8_t));
     cudaMalloc(&d_g_alt, num_stars * sizeof(uint8_t));
     cudaMalloc(&d_b_alt, num_stars * sizeof(uint8_t));
-    cudaMalloc(&d_is_dm_alt, num_stars * sizeof(bool));
+    cudaMalloc(&d_type_alt, num_stars * sizeof(uint8_t));
 
     cudaMalloc(&d_accels, num_stars * sizeof(float3));
 
@@ -270,7 +305,7 @@ void cuda_cleanup() {
     cudaFree(d_r); d_r = nullptr;
     cudaFree(d_g); d_g = nullptr;
     cudaFree(d_b); d_b = nullptr;
-    cudaFree(d_is_dm); d_is_dm = nullptr;
+    cudaFree(d_type); d_type = nullptr;
 
     cudaFree(d_x_alt); d_x_alt = nullptr;
     cudaFree(d_y_alt); d_y_alt = nullptr;
@@ -282,7 +317,7 @@ void cuda_cleanup() {
     cudaFree(d_r_alt); d_r_alt = nullptr;
     cudaFree(d_g_alt); d_g_alt = nullptr;
     cudaFree(d_b_alt); d_b_alt = nullptr;
-    cudaFree(d_is_dm_alt); d_is_dm_alt = nullptr;
+    cudaFree(d_type_alt); d_type_alt = nullptr;
 
     cudaFree(d_accels); d_accels = nullptr;
     
@@ -305,7 +340,7 @@ void cuda_upload_initial_stars(const Star* host_stars, int num_stars) {
                                                       d_x, d_y, d_z, 
                                                       d_vx, d_vy, d_vz, 
                                                       d_mass, d_r, d_g, d_b, 
-                                                      d_is_dm, num_stars);
+                                                      d_type, num_stars);
     cudaDeviceSynchronize();
 }
 
@@ -340,8 +375,8 @@ void cuda_physics_step(
 
     apply_sorted_indices_kernel<<<blocks_n, threads>>>(
         d_indices_out,
-        d_x, d_y, d_z, d_vx, d_vy, d_vz, d_mass, d_r, d_g, d_b, d_is_dm,
-        d_x_alt, d_y_alt, d_z_alt, d_vx_alt, d_vy_alt, d_vz_alt, d_mass_alt, d_r_alt, d_g_alt, d_b_alt, d_is_dm_alt,
+        d_x, d_y, d_z, d_vx, d_vy, d_vz, d_mass, d_r, d_g, d_b, d_type,
+        d_x_alt, d_y_alt, d_z_alt, d_vx_alt, d_vy_alt, d_vz_alt, d_mass_alt, d_r_alt, d_g_alt, d_b_alt, d_type_alt,
         num_stars
     );
 
@@ -349,7 +384,7 @@ void cuda_physics_step(
     swap_ptr(d_x, d_x_alt); swap_ptr(d_y, d_y_alt); swap_ptr(d_z, d_z_alt);
     swap_ptr(d_vx, d_vx_alt); swap_ptr(d_vy, d_vy_alt); swap_ptr(d_vz, d_vz_alt);
     swap_ptr(d_mass, d_mass_alt); swap_ptr(d_r, d_r_alt); swap_ptr(d_g, d_g_alt); swap_ptr(d_b, d_b_alt);
-    swap_ptr(d_is_dm, d_is_dm_alt);
+    swap_ptr(d_type, d_type_alt);
 
     // Initialize BvhNodes
     init_internal_nodes_kernel<<<blocks_n_minus_1, threads>>>(num_stars, d_bvh_nodes_tr, d_bvh_nodes_bd);
@@ -363,7 +398,7 @@ void cuda_physics_step(
     cudaDeviceSynchronize();
     query_gravity_bvh_kernel<<<blocks_n, threads>>>(d_x, d_y, d_z, d_mass, num_stars, d_bvh_nodes_tr, G, epsilon_sq, d_accels);
 
-    integrate_kernel<<<blocks_n, threads>>>(d_x, d_y, d_z, d_vx, d_vy, d_vz, d_accels, dt, num_stars);
+    integrate_kernel<<<blocks_n, threads>>>(d_x, d_y, d_z, d_vx, d_vy, d_vz, d_r, d_g, d_b, d_type, d_accels, dt, num_stars);
 
     // Render Mapping
     if (use_interop && cuda_vbo_resource) {
@@ -377,7 +412,7 @@ void cuda_physics_step(
                                                          d_x, d_y, d_z, 
                                                          d_vx, d_vy, d_vz, 
                                                          d_mass, d_r, d_g, d_b, 
-                                                         d_is_dm, num_stars);
+                                                         d_type, num_stars);
         
         cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
     } else {
@@ -385,7 +420,7 @@ void cuda_physics_step(
                                                          d_x, d_y, d_z, 
                                                          d_vx, d_vy, d_vz, 
                                                          d_mass, d_r, d_g, d_b, 
-                                                         d_is_dm, num_stars);
+                                                         d_type, num_stars);
         
         cudaMemcpy(host_stars, d_staging_stars, num_stars * sizeof(Star), cudaMemcpyDeviceToHost);
     }
