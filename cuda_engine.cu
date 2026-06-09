@@ -1,5 +1,6 @@
 #include "cuda_engine.h"
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #include <GL/gl.h>
@@ -7,179 +8,155 @@
 #include <cuda_gl_interop.h>
 #include <iostream>
 #include <vector>
+#include "morton.h"
+#include "karras_bvh.cuh"
 
 using namespace std;
 
-// Maximum nodes based on the 64MB Arena size
-const size_t MAX_NODES = (1024 * 1024 * 64) / sizeof(OctreeNode);
-const size_t MAX_LEAF_INDICES = MAX_NODES * 32;
+// GPU SoA Arrays
+float *d_x, *d_y, *d_z;
+float *d_vx, *d_vy, *d_vz;
+float *d_mass;
+uint8_t *d_r, *d_g, *d_b;
+bool *d_is_dm;
 
-// GPU Device Pointers (SoA Simulation Space)
-float* d_x = nullptr;
-float* d_y = nullptr;
-float* d_z = nullptr;
-float* d_vx = nullptr;
-float* d_vy = nullptr;
-float* d_vz = nullptr;
-float* d_mass = nullptr;
-uint8_t* d_r = nullptr;
-uint8_t* d_g = nullptr;
-uint8_t* d_b = nullptr;
-bool* d_is_dm = nullptr;
-float3* d_accels = nullptr;
+// Double Buffers for Sorting
+float *d_x_alt, *d_y_alt, *d_z_alt;
+float *d_vx_alt, *d_vy_alt, *d_vz_alt;
+float *d_mass_alt;
+uint8_t *d_r_alt, *d_g_alt, *d_b_alt;
+bool *d_is_dm_alt;
 
-// Pre-allocated GPU Tree Structures
-OctreeNode* d_nodes = nullptr;
-float* d_node_masses = nullptr;
-float* d_node_com_x = nullptr;
-float* d_node_com_y = nullptr;
-float* d_node_com_z = nullptr;
-uint32_t* d_leaf_star_indices = nullptr;
+float3* d_accels;
 
-// Staging buffer for non-interop Host to Device VBO transfers
-Star* d_staging_stars = nullptr;
+BvhNodeTraverse* d_bvh_nodes_tr;
+BvhNodeBuild* d_bvh_nodes_bd;
+uint64_t* d_morton_keys;
+uint64_t* d_morton_keys_out;
+int* d_indices;
+int* d_indices_out;
 
-// CUDA GL Graphic resource for VBO interop
-struct cudaGraphicsResource* cuda_vbo_resource = nullptr;
+void* d_temp_storage = nullptr;
+size_t temp_storage_bytes = 0;
 
-// Kernels
+Star* d_staging_stars;
+cudaGraphicsResource_t cuda_vbo_resource = nullptr;
 
-// Transpose AoS (Host layout) to SoA (GPU layout)
-__global__ void transpose_aos_to_soa_kernel(const Star* aos_stars, 
-                                            float* x, float* y, float* z,
-                                            float* vx, float* vy, float* vz,
-                                            float* mass, uint8_t* r, uint8_t* g, uint8_t* b,
-                                            bool* is_dm, int num_stars) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_stars) return;
-
-    Star s = aos_stars[i];
-    x[i] = s.x;
-    y[i] = s.y;
-    z[i] = s.z;
-    vx[i] = s.vx;
-    vy[i] = s.vy;
-    vz[i] = s.vz;
-    mass[i] = s.mass;
-    r[i] = s.r;
-    g[i] = s.g;
-    b[i] = s.b;
-    is_dm[i] = s.is_dm;
+template<typename T>
+void swap_ptr(T*& a, T*& b) {
+    T* temp = a;
+    a = b;
+    b = temp;
 }
 
-// Transpose SoA (GPU layout) to AoS (Mapped VBO layout)
-__global__ void transpose_soa_to_aos_kernel(Star* aos_stars,
-                                            const float* x, const float* y, const float* z,
-                                            const float* vx, const float* vy, const float* vz,
-                                            const float* mass, const uint8_t* r, const uint8_t* g, const uint8_t* b,
-                                            const bool* is_dm, int num_stars) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_stars) return;
-
-    aos_stars[i].x = x[i];
-    aos_stars[i].y = y[i];
-    aos_stars[i].z = z[i];
-    aos_stars[i].vx = vx[i];
-    aos_stars[i].vy = vy[i];
-    aos_stars[i].vz = vz[i];
-    aos_stars[i].mass = mass[i];
-    aos_stars[i].r = r[i];
-    aos_stars[i].g = g[i];
-    aos_stars[i].b = b[i];
-    aos_stars[i].is_dm = is_dm[i];
-}
-
-// Gravitational solver using stack-based octree traversal
-__global__ void query_gravity_kernel(
-    const float* x, const float* y, const float* z,
-    const float* mass,
-    int num_stars,
-    const OctreeNode* nodes,
-    const OctreeNode* cpu_root_pointer,
-    const float* node_masses,
-    const float* node_com_x,
-    const float* node_com_y,
-    const float* node_com_z,
-    const uint32_t* leaf_star_indices,
-    float G,
-    float epsilon_sq,
-    float3* accels
+// Unpack initial Star structs into SoA arrays
+__global__ void transpose_aos_to_soa_kernel(
+    const Star* in_stars,
+    float* x, float* y, float* z,
+    float* vx, float* vy, float* vz,
+    float* mass, uint8_t* r, uint8_t* g, uint8_t* b, bool* is_dm,
+    int num_stars
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_stars) return;
 
-    float my_x = x[i];
-    float my_y = y[i];
-    float my_z = z[i];
+    Star s = in_stars[i];
+    x[i] = s.x; y[i] = s.y; z[i] = s.z;
+    vx[i] = s.vx; vy[i] = s.vy; vz[i] = s.vz;
+    mass[i] = s.mass;
+    r[i] = s.r; g[i] = s.g; b[i] = s.b;
+    is_dm[i] = s.is_dm;
+}
+
+// Pack SoA arrays back into Star structs for rendering or host copy
+__global__ void transpose_soa_to_aos_kernel(
+    Star* out_stars,
+    const float* x, const float* y, const float* z,
+    const float* vx, const float* vy, const float* vz,
+    const float* mass, const uint8_t* r, const uint8_t* g, const uint8_t* b, const bool* is_dm,
+    int num_stars
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_stars) return;
+
+    out_stars[i].x = x[i]; out_stars[i].y = y[i]; out_stars[i].z = z[i];
+    out_stars[i].vx = vx[i]; out_stars[i].vy = vy[i]; out_stars[i].vz = vz[i];
+    out_stars[i].mass = mass[i];
+    out_stars[i].r = r[i]; out_stars[i].g = g[i]; out_stars[i].b = b[i];
+    out_stars[i].is_dm = is_dm[i];
+}
+
+// Gravity integration traversal using Binary BVH
+__global__ void query_gravity_bvh_kernel(
+    const float* x, const float* y, const float* z, const float* mass, 
+    int num_stars, const BvhNodeTraverse* nodes, 
+    float G, float epsilon_sq, float3* accels
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_stars) return;
+
+    float p_x = x[i];
+    float p_y = y[i];
+    float p_z = z[i];
 
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
 
-    // Shared memory stack to avoid L1/L2 spills from divergent threads
-    __shared__ int shared_stack[64 * 128]; // 64 depth max, 128 threads
-    int stack_ptr = 0;
-    shared_stack[stack_ptr * blockDim.x + threadIdx.x] = 0; // Root is at index 0
-    stack_ptr++;
+    // Fixed size stack
+    int stack[256];
+    int top = 0;
+    
+    stack[top++] = 0;
 
-    while (stack_ptr > 0) {
-        --stack_ptr;
-        int node_idx = shared_stack[stack_ptr * blockDim.x + threadIdx.x];
-        const OctreeNode& node = nodes[node_idx];
+    while (top > 0) {
+        int node_idx = stack[--top];
+        
+        float4 data0 = __ldg((const float4*)&nodes[node_idx]); 
+        float4 data1 = __ldg(((const float4*)&nodes[node_idx]) + 1);
 
-        if (node.is_leaf) {
-            for (uint32_t j = 0; j < node.star_count; j++) {
-                uint32_t star_idx = __ldg(&leaf_star_indices[node.start_star_index + j]);
-                if (star_idx == i) continue;
+        float n_com_x = data0.x;
+        float n_com_y = data0.y;
+        float n_com_z = data0.z;
+        float n_mass = data0.w;
+        
+        float width = data1.x;
+        int child_left = __float_as_int(data1.y);
+        int child_right = __float_as_int(data1.z);
 
-                float dx = __ldg(&x[star_idx]) - my_x;
-                float dy = __ldg(&y[star_idx]) - my_y;
-                float dz = __ldg(&z[star_idx]) - my_z;
+        bool is_leaf = (node_idx >= num_stars - 1);
 
-                float dist_sq = dx * dx + dy * dy + dz * dz + epsilon_sq;
+        float dx = n_com_x - p_x;
+        float dy = n_com_y - p_y;
+        float dz = n_com_z - p_z;
+        float dist_sq = dx*dx + dy*dy + dz*dz + epsilon_sq;
+
+        if (is_leaf) {
+            if (dist_sq > epsilon_sq * 1.01f) {
                 float inv_dist = rsqrtf(dist_sq);
-                float inv_dist_cube = inv_dist * inv_dist * inv_dist;
-
-                float f = G * __ldg(&mass[star_idx]) * inv_dist_cube;
+                float inv_dist3 = inv_dist * inv_dist * inv_dist;
+                float f = G * n_mass * inv_dist3;
                 ax += dx * f;
                 ay += dy * f;
                 az += dz * f;
             }
         } else {
-            // Calculate distance to center of mass
-            float dx = __ldg(&node_com_x[node_idx]) - my_x;
-            float dy = __ldg(&node_com_y[node_idx]) - my_y;
-            float dz = __ldg(&node_com_z[node_idx]) - my_z;
-
-            float dist_sq = dx * dx + dy * dy + dz * dz + epsilon_sq;
-
-            // Barnes-Hut criteria (theta = 1.0 implicitly from original code)
-            float width = node.half_width * 2.0f;
-            if (width * width < dist_sq) {
+            if (width * width < dist_sq * 1.0f) {
                 float inv_dist = rsqrtf(dist_sq);
-                float inv_dist_cube = inv_dist * inv_dist * inv_dist;
-                float f = G * __ldg(&node_masses[node_idx]) * inv_dist_cube;
+                float inv_dist3 = inv_dist * inv_dist * inv_dist;
+                float f = G * n_mass * inv_dist3;
                 ax += dx * f;
                 ay += dy * f;
                 az += dz * f;
             } else {
-                // Address child index on GPU using relative host pointer arithmetic
-                int child_base_idx = ((const char*)node.first_child - (const char*)cpu_root_pointer) / sizeof(OctreeNode);
-                uint8_t mask = node.active_mask;
-                for (int c = 7; c >= 0; --c) {
-                    if (mask & (1 << c)) {
-                        if (stack_ptr < 64) {
-                            shared_stack[stack_ptr * blockDim.x + threadIdx.x] = child_base_idx + c;
-                            stack_ptr++;
-                        }
-                    }
-                }
+                if (child_left != -1) stack[top++] = child_left;
+                if (child_right != -1) stack[top++] = child_right;
             }
         }
     }
-
+    
     accels[i] = make_float3(ax, ay, az);
 }
 
-// Simple leapfrog integration step
+// Leapfrog integration
 __global__ void integrate_kernel(
     float* x, float* y, float* z,
     float* vx, float* vy, float* vz,
@@ -203,7 +180,6 @@ __global__ void integrate_kernel(
 bool cuda_init(int num_stars) {
     cudaError_t err;
 
-    // Check for GPU devices
     int device_count = 0;
     err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess || device_count == 0) {
@@ -214,7 +190,7 @@ bool cuda_init(int num_stars) {
     err = cudaSetDevice(0);
     if (err != cudaSuccess) return false;
 
-    // Allocate SoA Buffers
+    // Allocate primary SoA
     cudaMalloc(&d_x, num_stars * sizeof(float));
     cudaMalloc(&d_y, num_stars * sizeof(float));
     cudaMalloc(&d_z, num_stars * sizeof(float));
@@ -226,17 +202,35 @@ bool cuda_init(int num_stars) {
     cudaMalloc(&d_g, num_stars * sizeof(uint8_t));
     cudaMalloc(&d_b, num_stars * sizeof(uint8_t));
     cudaMalloc(&d_is_dm, num_stars * sizeof(bool));
+    
+    // Allocate alternate SoA for sorting double-buffering
+    cudaMalloc(&d_x_alt, num_stars * sizeof(float));
+    cudaMalloc(&d_y_alt, num_stars * sizeof(float));
+    cudaMalloc(&d_z_alt, num_stars * sizeof(float));
+    cudaMalloc(&d_vx_alt, num_stars * sizeof(float));
+    cudaMalloc(&d_vy_alt, num_stars * sizeof(float));
+    cudaMalloc(&d_vz_alt, num_stars * sizeof(float));
+    cudaMalloc(&d_mass_alt, num_stars * sizeof(float));
+    cudaMalloc(&d_r_alt, num_stars * sizeof(uint8_t));
+    cudaMalloc(&d_g_alt, num_stars * sizeof(uint8_t));
+    cudaMalloc(&d_b_alt, num_stars * sizeof(uint8_t));
+    cudaMalloc(&d_is_dm_alt, num_stars * sizeof(bool));
+
     cudaMalloc(&d_accels, num_stars * sizeof(float3));
 
-    // Pre-allocate large node arrays to avoid malloc overheads inside frames
-    cudaMalloc(&d_nodes, MAX_NODES * sizeof(OctreeNode));
-    cudaMalloc(&d_node_masses, MAX_NODES * sizeof(float));
-    cudaMalloc(&d_node_com_x, MAX_NODES * sizeof(float));
-    cudaMalloc(&d_node_com_y, MAX_NODES * sizeof(float));
-    cudaMalloc(&d_node_com_z, MAX_NODES * sizeof(float));
-    cudaMalloc(&d_leaf_star_indices, MAX_LEAF_INDICES * sizeof(uint32_t));
+    // Allocate BVH arrays
+    int num_nodes = 2 * num_stars - 1;
+    cudaMalloc(&d_bvh_nodes_tr, num_nodes * sizeof(BvhNodeTraverse));
+    cudaMalloc(&d_bvh_nodes_bd, num_nodes * sizeof(BvhNodeBuild));
+    cudaMalloc(&d_morton_keys, num_stars * sizeof(uint64_t));
+    cudaMalloc(&d_morton_keys_out, num_stars * sizeof(uint64_t));
+    cudaMalloc(&d_indices, num_stars * sizeof(int));
+    cudaMalloc(&d_indices_out, num_stars * sizeof(int));
 
-    // Staging array
+    // Calculate CUB temp storage requirements
+    cub::DeviceRadixSort::SortPairs(nullptr, temp_storage_bytes, d_morton_keys, d_morton_keys_out, d_indices, d_indices_out, num_stars);
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+
     cudaMalloc(&d_staging_stars, num_stars * sizeof(Star));
 
     err = cudaGetLastError();
@@ -277,23 +271,34 @@ void cuda_cleanup() {
     cudaFree(d_g); d_g = nullptr;
     cudaFree(d_b); d_b = nullptr;
     cudaFree(d_is_dm); d_is_dm = nullptr;
-    cudaFree(d_accels); d_accels = nullptr;
 
-    cudaFree(d_nodes); d_nodes = nullptr;
-    cudaFree(d_node_masses); d_node_masses = nullptr;
-    cudaFree(d_node_com_x); d_node_com_x = nullptr;
-    cudaFree(d_node_com_y); d_node_com_y = nullptr;
-    cudaFree(d_node_com_z); d_node_com_z = nullptr;
-    cudaFree(d_leaf_star_indices); d_leaf_star_indices = nullptr;
+    cudaFree(d_x_alt); d_x_alt = nullptr;
+    cudaFree(d_y_alt); d_y_alt = nullptr;
+    cudaFree(d_z_alt); d_z_alt = nullptr;
+    cudaFree(d_vx_alt); d_vx_alt = nullptr;
+    cudaFree(d_vy_alt); d_vy_alt = nullptr;
+    cudaFree(d_vz_alt); d_vz_alt = nullptr;
+    cudaFree(d_mass_alt); d_mass_alt = nullptr;
+    cudaFree(d_r_alt); d_r_alt = nullptr;
+    cudaFree(d_g_alt); d_g_alt = nullptr;
+    cudaFree(d_b_alt); d_b_alt = nullptr;
+    cudaFree(d_is_dm_alt); d_is_dm_alt = nullptr;
+
+    cudaFree(d_accels); d_accels = nullptr;
     
+    cudaFree(d_bvh_nodes_tr); d_bvh_nodes_tr = nullptr;
+    cudaFree(d_bvh_nodes_bd); d_bvh_nodes_bd = nullptr;
+    cudaFree(d_morton_keys); d_morton_keys = nullptr;
+    cudaFree(d_morton_keys_out); d_morton_keys_out = nullptr;
+    cudaFree(d_indices); d_indices = nullptr;
+    cudaFree(d_indices_out); d_indices_out = nullptr;
+    cudaFree(d_temp_storage); d_temp_storage = nullptr;
+
     cudaFree(d_staging_stars); d_staging_stars = nullptr;
 }
 
 void cuda_upload_initial_stars(const Star* host_stars, int num_stars) {
-    // Stage upload
     cudaMemcpy(d_staging_stars, host_stars, num_stars * sizeof(Star), cudaMemcpyHostToDevice);
-
-    // Unpack into SoA layout on GPU
     int threads = 256;
     int blocks = (num_stars + threads - 1) / threads;
     transpose_aos_to_soa_kernel<<<blocks, threads>>>(d_staging_stars, 
@@ -315,68 +320,68 @@ void cuda_unregister_vbo() {
     }
 }
 
-// Executes one simulation frame
+// Executes one simulation frame natively on the GPU
 void cuda_physics_step(
     Star* host_stars, 
     int num_stars, 
     float G, 
     float epsilon_sq, 
     float dt,
-    const OctreeNode* nodes,
-    const OctreeNode* cpu_root_pointer,
-    int num_nodes,
-    const float* node_masses,
-    const float* node_com_x,
-    const float* node_com_y,
-    const float* node_com_z,
-    const uint32_t* leaf_star_indices,
+    float global_min,
+    float global_max,
     bool use_interop
 ) {
-    // Copy the tree metadata to GPU
-    cudaMemcpy(d_nodes, nodes, num_nodes * sizeof(OctreeNode), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_node_masses, node_masses, num_nodes * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_node_com_x, node_com_x, num_nodes * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_node_com_y, node_com_y, num_nodes * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_node_com_z, node_com_z, num_nodes * sizeof(float), cudaMemcpyHostToDevice);
-    
-    // Morton index arrays
-    size_t active_leaf_indices = num_nodes * 32;
-    cudaMemcpy(d_leaf_star_indices, leaf_star_indices, active_leaf_indices * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    int threads = 256;
+    int blocks_n = (num_stars + threads - 1) / threads;
+    int blocks_n_minus_1 = (num_stars - 1 + threads - 1) / threads;
 
-    // Launch gravity and integration kernels in parallel SoA space
-    int threads = 128;
-    int blocks = (num_stars + threads - 1) / threads;
+    compute_morton_and_indices_kernel<<<blocks_n, threads>>>(d_x, d_y, d_z, d_morton_keys, d_indices, num_stars, global_min, global_max);
+    cub::DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, d_morton_keys, d_morton_keys_out, d_indices, d_indices_out, num_stars);
 
-    query_gravity_kernel<<<blocks, threads>>>(d_x, d_y, d_z, d_mass, num_stars, 
-                                             d_nodes, cpu_root_pointer,
-                                             d_node_masses, d_node_com_x, d_node_com_y, d_node_com_z, 
-                                             d_leaf_star_indices, G, epsilon_sq, d_accels);
-    
-    integrate_kernel<<<blocks, threads>>>(d_x, d_y, d_z, d_vx, d_vy, d_vz, d_accels, dt, num_stars);
+    apply_sorted_indices_kernel<<<blocks_n, threads>>>(
+        d_indices_out,
+        d_x, d_y, d_z, d_vx, d_vy, d_vz, d_mass, d_r, d_g, d_b, d_is_dm,
+        d_x_alt, d_y_alt, d_z_alt, d_vx_alt, d_vy_alt, d_vz_alt, d_mass_alt, d_r_alt, d_g_alt, d_b_alt, d_is_dm_alt,
+        num_stars
+    );
 
-    // Render Mapping (VRAM to VRAM copy)
+    // Swap pointers
+    swap_ptr(d_x, d_x_alt); swap_ptr(d_y, d_y_alt); swap_ptr(d_z, d_z_alt);
+    swap_ptr(d_vx, d_vx_alt); swap_ptr(d_vy, d_vy_alt); swap_ptr(d_vz, d_vz_alt);
+    swap_ptr(d_mass, d_mass_alt); swap_ptr(d_r, d_r_alt); swap_ptr(d_g, d_g_alt); swap_ptr(d_b, d_b_alt);
+    swap_ptr(d_is_dm, d_is_dm_alt);
+
+    // Initialize BvhNodes
+    init_internal_nodes_kernel<<<blocks_n_minus_1, threads>>>(num_stars, d_bvh_nodes_tr, d_bvh_nodes_bd);
+    init_leaves_kernel<<<blocks_n, threads>>>(num_stars, d_bvh_nodes_tr, d_bvh_nodes_bd, d_x, d_y, d_z, d_mass);
+
+    build_radix_tree_kernel<<<blocks_n_minus_1, threads>>>(num_stars, d_morton_keys_out, d_bvh_nodes_tr, d_bvh_nodes_bd);
+
+    cudaDeviceSynchronize();
+    aggregate_bvh_kernel<<<blocks_n, threads>>>(num_stars, d_bvh_nodes_tr, d_bvh_nodes_bd);
+
+    cudaDeviceSynchronize();
+    query_gravity_bvh_kernel<<<blocks_n, threads>>>(d_x, d_y, d_z, d_mass, num_stars, d_bvh_nodes_tr, G, epsilon_sq, d_accels);
+
+    integrate_kernel<<<blocks_n, threads>>>(d_x, d_y, d_z, d_vx, d_vy, d_vz, d_accels, dt, num_stars);
+
+    // Render Mapping
     if (use_interop && cuda_vbo_resource) {
         Star* d_vbo_stars = nullptr;
         size_t num_bytes = 0;
 
-        // Map buffer for CUDA access
         cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
         cudaGraphicsResourceGetMappedPointer((void**)&d_vbo_stars, &num_bytes, cuda_vbo_resource);
 
-        // Pack the SoA coordinates directly inside the VBO
-        transpose_soa_to_aos_kernel<<<blocks, threads>>>(d_vbo_stars, 
+        transpose_soa_to_aos_kernel<<<blocks_n, threads>>>(d_vbo_stars, 
                                                          d_x, d_y, d_z, 
                                                          d_vx, d_vy, d_vz, 
                                                          d_mass, d_r, d_g, d_b, 
                                                          d_is_dm, num_stars);
         
-        // Copy back to CPU stars array so host has position data for next frame's tree builder
-        cudaMemcpy(host_stars, d_vbo_stars, num_stars * sizeof(Star), cudaMemcpyDeviceToHost);
-
         cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
     } else {
-        // Fallback for Baking (or non-interop): Pack SoA into staging AoS block on GPU, and copy to host
-        transpose_soa_to_aos_kernel<<<blocks, threads>>>(d_staging_stars, 
+        transpose_soa_to_aos_kernel<<<blocks_n, threads>>>(d_staging_stars, 
                                                          d_x, d_y, d_z, 
                                                          d_vx, d_vy, d_vz, 
                                                          d_mass, d_r, d_g, d_b, 

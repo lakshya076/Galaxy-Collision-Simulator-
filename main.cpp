@@ -191,41 +191,40 @@ int main(int argc, char** argv) {
             stars[i] = sort_buffer[i].second;
         }
 
-        auto t_build_start = chrono::high_resolution_clock::now();
-
-        // Reset Arena and Build Octree (CPU tree building is very fast)
-        arena.reset();
-        OctreeNode* root = arena.alloc<OctreeNode>();
-
-        float max_span = std::max({max_x - min_x, max_y - min_y, max_z - min_z});
-        root->half_width = max_span * 0.5f;
-        root->center_x = (min_x + max_x) * 0.5f;
-        root->center_y = (min_y + max_y) * 0.5f;
-        root->center_z = (min_z + max_z) * 0.5f;
-        root->is_leaf = true;
-        root->star_count = 0;
-
-        uint32_t next_free_idx = 0;
-        root->start_star_index = next_free_idx;
-        next_free_idx += 32;
-
-        for (uint32_t i = 0; i < num_stars; i++) {
-            insert_star(root, i, stars, arena, leaf_star_indices, next_free_idx);
-        }
-
-        // Metadata Population
-        node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices);
 
         if (use_gpu) {
             cuda_physics_step(
                 stars, num_stars, G, epsilon_sq, dt,
-                static_cast<const OctreeNode*>(arena.get_base_ptr()),
-                static_cast<const OctreeNode*>(arena.get_base_ptr()),
-                arena.get_used_memory() / sizeof(OctreeNode),
-                node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices,
-                false // use_interop = false for BAKE
+                global_min, global_max, false
             );
         } else {
+            auto t_build_start = chrono::high_resolution_clock::now();
+
+            // Reset Arena and Build CPU Octree
+            arena.reset();
+            OctreeNode* root = arena.alloc<OctreeNode>();
+
+            float max_span = std::max({max_x - min_x, max_y - min_y, max_z - min_z});
+            root->center_x = (min_x + max_x) * 0.5f;
+            root->center_y = (min_y + max_y) * 0.5f;
+            root->center_z = (min_z + max_z) * 0.5f;
+            root->half_width = max_span * 0.5f;
+            root->is_leaf = true;
+            root->start_star_index = 0;
+            root->star_count = 0;
+
+            uint32_t next_free_idx = 0;
+            root->start_star_index = next_free_idx;
+            next_free_idx += 32;
+
+            for (uint32_t i = 0; i < num_stars; i++) {
+                insert_star(root, i, stars, arena, leaf_star_indices, next_free_idx);
+            }
+
+            int num_nodes = arena.get_used_memory() / sizeof(OctreeNode);
+            
+            node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices);
+
             // Gravity Queries
             #pragma omp parallel for schedule(dynamic, 256)
             for (int i = 0; i < num_stars; ++i) {
@@ -250,20 +249,14 @@ int main(int argc, char** argv) {
         }
 
         auto t_gpu_end = chrono::high_resolution_clock::now();
-        if (frame_count == 1) {
-            cout << "Sort: " << chrono::duration<double>(t_build_start - t_sort_start).count() << "s\n";
-            cout << "Build: " << chrono::duration<double>(t_gpu_end - t_build_start).count() << "s\n"; // Wait, t_gpu_start wasn't defined. Let's fix that.
-        }
 
         // Wait for the background writer thread from the previous frame to finish
         if (writer_thread.joinable()) {
             writer_thread.join();
         }
 
-        // Swap write buffers for double-buffering
         std::swap(current_write_buf, next_write_buf);
 
-        // Copy visible stars from the current frame to the write buffer
         int local_write_count = 0;
         for (int i = 0; i < num_stars; ++i) {
             if (!stars[i].is_dm) {
@@ -443,68 +436,67 @@ int main(int argc, char** argv) {
         
         process_input(window);
 
-        // Calculate Bounds
-        float min_x = numeric_limits<float>::max(), min_y = numeric_limits<float>::max(), min_z = numeric_limits<float>::max();
-        float max_x = numeric_limits<float>::lowest(), max_y = numeric_limits<float>::lowest(), max_z = numeric_limits<float>::lowest();
-
-        for (size_t i = 0; i < num_stars; i++) {
-            if (stars[i].x < min_x) min_x = stars[i].x;
-            if (stars[i].y < min_y) min_y = stars[i].y;
-            if (stars[i].z < min_z) min_z = stars[i].z;
-            if (stars[i].x > max_x) max_x = stars[i].x;
-            if (stars[i].y > max_y) max_y = stars[i].y;
-            if (stars[i].z > max_z) max_z = stars[i].z;
-        }
-
-        float global_min = std::min({min_x, min_y, min_z});
-        float global_max = std::max({max_x, max_y, max_z});
-
-        // Morton Sort
-#if defined(_MSC_VER)
-        std::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
-            return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
-                   get_morton_code(b.x, b.y, b.z, global_min, global_max);
-        });
-#else
-        __gnu_parallel::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
-            return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
-                   get_morton_code(b.x, b.y, b.z, global_min, global_max);
-        });
-#endif
-
-        // Reset Arena and Build Octree
-        arena.reset();
-        OctreeNode* root = arena.alloc<OctreeNode>();
-
-        float max_span = std::max({max_x - min_x, max_y - min_y, max_z - min_z});
-        root->half_width = max_span * 0.5f;
-        root->center_x = (min_x + max_x) * 0.5f;
-        root->center_y = (min_y + max_y) * 0.5f;
-        root->center_z = (min_z + max_z) * 0.5f;
-        root->is_leaf = true;
-        root->star_count = 0;
-
-        uint32_t next_free_idx = 0;
-        root->start_star_index = next_free_idx;
-        next_free_idx += 32;
-
-        for (uint32_t i = 0; i < num_stars; i++) {
-            insert_star(root, i, stars, arena, leaf_star_indices, next_free_idx);
-        }
-
-        // Metadata Population
-        node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices);
+        float global_min = -10000.0f;
+        float global_max = 10000.0f;
 
         if (use_gpu) {
             cuda_physics_step(
                 stars, num_stars, G, epsilon_sq, dt,
-                static_cast<const OctreeNode*>(arena.get_base_ptr()),
-                static_cast<const OctreeNode*>(arena.get_base_ptr()),
-                arena.get_used_memory() / sizeof(OctreeNode),
-                node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices,
-                true // use_interop = true for LIVE
+                global_min, global_max, true // use_interop = true for LIVE
             );
         } else {
+            // Calculate Bounds for CPU Octree only
+            float min_x = numeric_limits<float>::max(), min_y = numeric_limits<float>::max(), min_z = numeric_limits<float>::max();
+            float max_x = numeric_limits<float>::lowest(), max_y = numeric_limits<float>::lowest(), max_z = numeric_limits<float>::lowest();
+
+            for (size_t i = 0; i < num_stars; i++) {
+                if (stars[i].x < min_x) min_x = stars[i].x;
+                if (stars[i].y < min_y) min_y = stars[i].y;
+                if (stars[i].z < min_z) min_z = stars[i].z;
+                if (stars[i].x > max_x) max_x = stars[i].x;
+                if (stars[i].y > max_y) max_y = stars[i].y;
+                if (stars[i].z > max_z) max_z = stars[i].z;
+            }
+
+            global_min = std::min({min_x, min_y, min_z});
+            global_max = std::max({max_x, max_y, max_z});
+            
+#if defined(_MSC_VER)
+            std::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
+                return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
+                       get_morton_code(b.x, b.y, b.z, global_min, global_max);
+            });
+#else
+            __gnu_parallel::sort(stars, stars + num_stars, [global_min, global_max](const Star& a, const Star& b) {
+                return get_morton_code(a.x, a.y, a.z, global_min, global_max) < 
+                       get_morton_code(b.x, b.y, b.z, global_min, global_max);
+            });
+#endif
+            // Reset Arena and Build CPU Octree
+            arena.reset();
+            OctreeNode* root = arena.alloc<OctreeNode>();
+
+            float max_span = std::max({max_x - min_x, max_y - min_y, max_z - min_z});
+            root->center_x = (min_x + max_x) * 0.5f;
+            root->center_y = (min_y + max_y) * 0.5f;
+            root->center_z = (min_z + max_z) * 0.5f;
+            root->half_width = max_span * 0.5f;
+            root->is_leaf = true;
+            root->start_star_index = 0;
+            root->star_count = 0;
+
+            uint32_t next_free_idx = 0;
+            root->start_star_index = next_free_idx;
+            next_free_idx += 32;
+
+            for (uint32_t i = 0; i < num_stars; i++) {
+                insert_star(root, i, stars, arena, leaf_star_indices, next_free_idx);
+            }
+
+            int num_nodes = arena.get_used_memory() / sizeof(OctreeNode);
+            
+            node_physics(root, root, stars, node_masses, node_com_x, node_com_y, node_com_z, leaf_star_indices);
+
             // Gravity Queries
             #pragma omp parallel for schedule(dynamic, 256)
             for (int i = 0; i < num_stars; ++i) {

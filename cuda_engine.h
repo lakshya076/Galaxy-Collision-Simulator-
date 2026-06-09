@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-// Check if GPU is present and initialize CUDA structures
+
 bool cuda_init(int num_stars);
 void cuda_cleanup();
 
@@ -25,13 +25,7 @@ void cuda_physics_step(
     float G, 
     float epsilon_sq, 
     float dt,
-    const OctreeNode* nodes,
-    const OctreeNode* cpu_root_pointer,
-    int num_nodes,
-    const float* node_masses,
-    const float* node_com_x,
-    const float* node_com_y,
-    const float* node_com_z,
-    const uint32_t* leaf_star_indices,
+    float global_min,
+    float global_max,
     bool use_interop
 );
