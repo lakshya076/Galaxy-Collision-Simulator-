@@ -8,7 +8,7 @@ A high-performance, custom-built 3D Galaxy Collision Simulator written in pure C
 
 This project is built incrementally following the roadmap:
 
-- **Foundation & Spatial DB Integration** - Standardized particle representations, memory pooling, and importing stellar catalogs from spatial data sources. This was completed in another project first stored as **[Spatial_DB Repository](https://github.com/lakshya076/Spatial_DB)**. Currently instead of loading external data, mathematical models are used to generate two galaxies, the full generated data is stored in the Octree format to optimize Barnes-Hut later.
+- **Foundation & Spatial DB Integration** - Standardized particle representations, memory pooling, and importing stellar catalogs from spatial data sources. This was completed in another project first stored as **[Spatial_DB Repository](https://github.com/lakshya076/Spatial_DB)**. Currently instead of loading external data, mathematical models are used to generate two galaxies, the full generated data is stored in the Octree format (for CPU based rendering) to optimize Barnes-Hut later.
 - **Initial Conditions Generator** - Mathematical generation of stable galaxies using
   - Miyamoto-Nagai stellar discs
   - Hernquist bulges
@@ -22,7 +22,12 @@ This project is built incrementally following the roadmap:
 
 ## 🛠️ Architecture & Constraints
 
-To achieve extreme real-time simulation performance, the engine adheres to strict hardware-friendly memory layouts and caching constraints:
+Current the project runs in three modes:
+#### 1. Live Mode - Runs the simulation and visualizes it in real-time.
+#### 2. Bake Mode - Runs the simulation and bakes it to a binary file (simulation.bin).
+#### 3. Playback Mode - Reads the baked binary file and visualizes it.
+
+To achieve real-time simulation performance, the engine adheres to strict hardware-friendly memory layouts and caching constraints:
 
 ### 1. The Memory Pool (`ArenaAllocator`)
 Instead of standard dynamic allocations (`new`/`delete`) which cause memory fragmentation and latency, the simulator relies on a custom `ArenaAllocator`. It provisions contiguous blocks of RAM instantly. The arena is completely wiped (pointer reset to 0) and rebuilt every single frame.
@@ -54,10 +59,19 @@ Because the `OctreeNode` cannot exceed 32 bytes, all node-level physics data (su
 * **Manual L1 Memory Prefetching:** The hottest direct-gravity math loop utilizes compiler intrinsics (`__builtin_prefetch`) to actively pull the *next* star's data into the L1 cache while the FPU computes the inverse square root math for the *current* star.
 
 ### 7. GPU CUDA Architecture
-* **Structure of Arrays (SoA):** Before launching the physics kernels, the `Star` array (AoS) is transposed into separate parallel arrays (`d_x`, `d_y`, `d_z`, etc.) in VRAM. This guarantees perfectly coalesced memory access across 32-thread warps.
-* **Non-Recursive Octree Traversal:** The GPU traverses the Barnes-Hut octree using a highly optimized iterative stack stored locally per-thread. This avoids recursive function calls which would otherwise cause massive local memory allocation and slow down the GPU.
-* **Active Node Masking:** To prevent the GPU from wasting cycles evaluating empty regions of space, the CPU tree builder populates an 8-bit `active_mask` in each `OctreeNode`. The GPU checks this bitmask and only pushes populated children onto its traversal stack.
-* **Zero-Copy VBO Interop:** In Live mode, CUDA registers and maps the OpenGL Vertex Buffer Objects (VBOs) directly. The calculated physics positions are written straight into the graphics memory buffer. This eliminates the need to transfer the positions back to the CPU over the PCIe bus to render them, massively improving framerates.
+* **Karras 2012 Binary Radix Tree:** The CPU Octree builder was entirely eliminated because CPU-GPU memory copies (`cudaMemcpy`) became the ultimate bottleneck. The GPU now builds its own tree every frame using the Karras 2012 algorithm. This assigns 64-bit Morton codes to all particles, sorts them via `cub::DeviceRadixSort`, and constructs a Binary Bounding Volume Hierarchy (BVH) purely through fast bitwise longest-common-prefix searches.
+* **Split BVH Structs (AoS to SoA):** The BVH tree nodes are split into two parallel arrays: `BvhNodeBuild` (containing bounding boxes used during aggregation) and `BvhNodeTraverse` (containing only mass, center of mass, and child indices). This 32-byte cache-aligned structure prevents cache thrashing during traversal.
+* **Hardware Read-Only Cache (`__ldg`):** The gravity kernel traverses the BVH tree using `__ldg((float4*)node)` intrinsics, which forces the GPU to route memory fetches through the Read-Only Texture Cache. Since the BVH topology does not change during the gravity step, this massively accelerates memory bandwidth.
+* **Active Node Masking (Legacy):** In earlier revisions, the CPU octree populated an 8-bit `active_mask` to prevent the GPU from evaluating empty spatial octants. With the transition to the 100% GPU-resident Binary BVH, empty space is mathematically eliminated by the Radix Tree structure itself, rendering the mask obsolete.
+* **Zero-Copy VBO Interop & Live Mode:** In Live mode, CUDA registers and maps the OpenGL Vertex Buffer Objects (VBOs) directly. The calculated physics positions are written straight into the graphics memory buffer without hitting the PCIe bus (`cudaMemcpyDeviceToHost` is entirely bypassed). In addition, all CPU bounding box calculations and Morton sorting are bypassed, leaving the CPU completely idle during Live rendering.
+
+### 8. Physics Integration & Stability
+* **Semi-Implicit Euler (Leapfrog) Integration:** The engine uses Leapfrog integration which preserves orbital energy significantly better than standard explicit Euler integration.
+* **Dark Matter Gravity Softening:** Dark Matter is simulated as massive diffuse gas halos using a large softening length parameter (`epsilon_sq = 10.0f`). This physically caps the maximum gravity experienced by passing stars, preventing catastrophic orbital ejections while maintaining extreme 100% timescale collisions.
+
+### 9. Visual Rendering
+* **Velocity-Based Color Mapping:** The collision assigns distinct Fire (Red/Yellow) and Ice (Blue/Cyan) color palettes to the two galaxies based on orbital velocity and core temperature.
+* **Faint Halo Rendering:** Dark Matter macro-particles are flagged on the GPU as `type = 1` and rendered natively as a faint purple mist using OpenGL alpha blending and discard shaders.
 
 ---
 
@@ -80,10 +94,12 @@ Here is the evolution of the per-frame generation time (lower is better):
 | Implementation Phase | Frame Gen Time | Effective FPS | Notes |
 | :--- | :--- | :--- | :--- |
 | **1. Baseline CPU (Single Threaded)** | ~39.96 s | ~0.025 FPS | Initial Conditions.|
-| **1. Baseline CPU (OpenMP)** | ~2.00 s | ~0.5 FPS | Achieved parallelization using OpenMP.|
-| **2. Initial CUDA GPU Port** | ~0.45 s | ~2.2 FPS | Naive GPU physics computation using standard data layouts. |
-| **3. Heavily Optimized GPU** | ~0.30 s | ~3.3 FPS | **Current State.** 30% speedup achieved by pre-computing Morton Sorting on CPU (`0.02s`), switching to SoA VRAM layouts, storing the traversal stack in 64KB `__shared__` memory, caching reads with `__ldg`, and skipping empty space with the `active_mask`.<br><br>*(Note: The actual GPU math now only takes **0.05 seconds**. The total time is currently bottlenecked by the sequential CPU octree builder).* |
-| **4. Playback Mode (Zero-Physics)** | ~0.007 s | **Adjustable FPS** | Bypasses all physics and streams the baked `simulation.bin` directly into the GPU's VRAM. Limited only by disk read speed and monitor refresh rate. |
+| **2. Baseline CPU (OpenMP)** | ~2.00 s | ~0.5 FPS | Achieved parallelization using OpenMP.|
+| **3. Initial CUDA GPU Port** | ~0.45 s | ~2.2 FPS | Naive GPU physics computation using standard data layouts. |
+| **4. Hybrid GPU Physics + CPU Octree** | ~0.30 s | ~3.3 FPS | Pre-computed Morton Sorting on CPU and used SoA VRAM layouts. Bottlenecked heavily by CPU tree building (`0.22s`) and `cudaMemcpy` overhead. |
+| **5. Fully GPU-Resident (Bake Mode)** | ~0.031 s | ~31.4 FPS | The CPU is completely bypassed. The GPU sorts, builds a Karras Binary BVH, aggregates mass, and solves gravity all in VRAM. Tree building takes `< 3.2ms`. The gravity traversal is accelerated using `__ldg` through the hardware texture cache. |
+| **6. Fully GPU-Resident (Live Mode)** | ~0.065 s | ~20 FPS | **Current State.** Exactly the same physics performance as Bake mode, plus the overhead of rendering 300,000 points dynamically via OpenGL. PCIe transfers (`cudaMemcpyDeviceToHost`) and CPU processing are completely eliminated using VBO mapping. |
+| **7. Playback Mode (Zero-Physics)** | - | **Adjustable FPS** | Bypasses all physics and streams the baked `simulation.bin` directly into the GPU's VRAM. Limited only by disk read speed and monitor refresh rate. |
 
 ---
 
@@ -98,9 +114,9 @@ Here is the evolution of the per-frame generation time (lower is better):
 * Modern OpenGL development libraries (GLFW, GLEW, GLM).
 
 #### For GPU-Accelerated (CUDA) Build:
-* **NVIDIA GPU** with CUDA support.
-* **NVIDIA CUDA Toolkit** (containing the `nvcc` compiler). [Download Here](https://developer.nvidia.com/cuda-downloads)
-* **Microsoft Visual Studio (MSVC)**: On Windows, `nvcc` strictly requires the MSVC host compiler (`cl.exe`) to preprocess host-side code. [Download Here](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
+* **NVIDIA GPU** with CUDA support. This project was made on **NVIDIA RTX 3050 Laptop GPU**
+* **NVIDIA CUDA Toolkit**. [Download Here](https://developer.nvidia.com/cuda-downloads)
+* **Microsoft Visual Studio (MSVC)**. [Download Here](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
 * Modern OpenGL development libraries (GLFW, GLEW, GLM).
 
 On MSYS2 (Windows), install the OpenGL dependencies:
@@ -125,7 +141,7 @@ This simulator is split into three decoupled execution modes, allowing you to ba
 Runs the physics engine and immediately renders each frame. Best for real-time visualization of moderate to large particle counts.
 * **GPU CUDA Build (Recommended):**
   ```bash
-  nvcc -O3 -arch=sm_86 -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o main.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
+  nvcc -std=c++17 -O3 -arch=sm_86 -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2 /Zc:preprocessor" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o main.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
   $env:PATH += ";C:\msys64\mingw64\bin"; .\main.exe
   ```
   *(Pass the `--cpu` argument at runtime to bypass the GPU and run on OpenMP CPU fallback.)*
@@ -139,7 +155,7 @@ Runs the physics engine and immediately renders each frame. Best for real-time v
 Calculates physics as fast as possible in the terminal (window rendering is disabled) and dumps the visible stars to `simulation.bin` using the compact 16-byte `PlaybackStar` format. For a 1000 frame bake, this file reaches around **3.2 GB** in size (down from the uncompressed **9.2 GB** thanks to dark matter filtering and attribute stripping).
 * **GPU CUDA Build (Recommended):**
   ```bash
-  nvcc -O3 -arch=sm_86 -DMODE_BAKE -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o bake.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
+  nvcc -std=c++17 -O3 -arch=sm_86 -DMODE_BAKE -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2 /Zc:preprocessor" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o bake.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
   $env:Path += ";C:\msys64\mingw64\bin"; .\bake.exe <num_frames>
   ```
   *(Pass `--cpu` as the second argument, e.g. `.\bake.exe 1000 --cpu`, to bake using the CPU engine.)*
@@ -153,10 +169,10 @@ Calculates physics as fast as possible in the terminal (window rendering is disa
 Disables the physics engine entirely. Initializes OpenGL and rapidly streams the pre-baked frames from `simulation.bin` directly into the VRAM at adjustable FPS.
 * **GPU CUDA Build (Recommended):**
   ```bash
-  nvcc -O3 -arch=sm_86 -DMODE_PLAYBACK -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o play.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
+  nvcc -std=c++17 -O3 -arch=sm_86 -DMODE_PLAYBACK -ccbin "D:\VisualStudio\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" -Xcompiler "/openmp /fp:fast /arch:AVX2 /Zc:preprocessor" .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp .\cuda_engine.cu -o play.exe -I"C:\msys64\mingw64\include" "C:\msys64\mingw64\lib\libglfw3.dll.a" "C:\msys64\mingw64\lib\libglew32.dll.a" -lopengl32 -lgdi32 -luser32 -lshell32
   $env:PATH += ";C:\msys64\mingw64\bin"; .\play.exe
   ```
-* **CPU-Only GCC Build:**
+  * **CPU-Only GCC Build:**
   ```bash
   g++ -std=c++17 -O3 -fopenmp -ffast-math -march=native -DMODE_PLAYBACK .\main.cpp .\generator.cpp .\engine.cpp .\gravity_aggregator.cpp .\renderer.cpp -o play_cpu.exe -I"C:\msys64\mingw64\include" -L"C:\msys64\mingw64\lib" -lglfw3 -lglew32 -lopengl32 -lgdi32
   $env:PATH += ";C:\msys64\mingw64\bin"; .\play_cpu.exe
@@ -170,4 +186,5 @@ Disables the physics engine entirely. Initializes OpenGL and rapidly streams the
 - **SPACE:** Pause / Resume playback (Playback mode only).
 - **UP / DOWN:** Increase / Decrease speed (target FPS) (Playback mode only).
 - **LEFT / RIGHT:** Step 1 frame Backward / Forward (when paused in Playback mode).
+- **L:** Toggle cinematic Center of Mass Camera Lock.
 - **ESC:** Exit Simulation.
